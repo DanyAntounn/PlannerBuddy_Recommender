@@ -1,10 +1,8 @@
 import nltk
 import os
 
-try:
-    nltk.data.path.append("/usr/local/nltk_data")
-except Exception as e:
-    print("NLTK data path append failed:", e)
+# Ensure NLTK uses Docker-installed data
+nltk.data.path.append("/usr/local/nltk_data")
 
 import numpy as np
 from nltk.tokenize import word_tokenize
@@ -26,17 +24,14 @@ def preprocess_text(text):
 # Simple scoring
 def compute_score(user_profile, features, reviews):
     score = 0
-
     # Match features
     for pref in user_profile.get("preferences", []):
         if pref.lower() in features:
             score += 1
-
     # Sentiment on reviews
     sentiments = [sia.polarity_scores(r)["compound"] for r in reviews]
     if sentiments:
         score += float(np.mean(sentiments))
-
     return float(score)
 
 # Food recommender
