@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m pip install --no-cache-dir nltk numpy
 
 # Download all necessary NLTK data into /usr/local/nltk_data
-RUN python -m nltk.downloader punkt vader_lexicon stopwords wordnet -d /usr/local/nltk_data
+RUN python -m nltk.downloader punkt vader_lexicon stopwords wordnet punkt_tab -d /usr/local/nltk_data
 
 # Copy app code
 COPY . .
