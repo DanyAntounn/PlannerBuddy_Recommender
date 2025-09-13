@@ -1,8 +1,8 @@
 import nltk
-import os
-
 # Ensure NLTK uses Docker-installed data
 nltk.data.path.append("/usr/local/nltk_data")
+import os
+
 
 import numpy as np
 from nltk.tokenize import word_tokenize
