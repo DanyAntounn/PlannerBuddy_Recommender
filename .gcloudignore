@@ -1,0 +1,16 @@
+# Ignore Visual Studio folders
+.vs/
+bin/
+obj/
+
+# Ignore git stuff
+.git/
+.gitignore
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore local files
+*.log
+*.tmp
