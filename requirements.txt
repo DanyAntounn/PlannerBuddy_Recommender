@@ -3,3 +3,6 @@ uvicorn
 nltk
 numpy
 requests
+openai
+fuzzywuzzy
+python-Levenshtein
