@@ -12,7 +12,7 @@ from nltk.stem import WordNetLemmatizer
 from fuzzywuzzy import fuzz
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_API_KEY = os.getebnv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 sia = SentimentIntensityAnalyzer()
 lemmatizer = WordNetLemmatizer()
