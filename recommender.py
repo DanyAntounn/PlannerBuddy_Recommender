@@ -11,7 +11,7 @@ from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from fuzzywuzzy import fuzz
 
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "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"
 GOOGLE_API_KEY = "AIzaSyCSWMWno-RiGOWlkswcmoa8Q11VocfPcNs"
 
 sia = SentimentIntensityAnalyzer()
