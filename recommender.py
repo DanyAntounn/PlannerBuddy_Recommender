@@ -69,10 +69,12 @@ def extract_requirements_with_openai(user_query: str) -> dict:
                       {"role":"user","content":user_query}],
             temperature=0
         )
+        print("OpenAI response:", resp.choices[0].message.content)
         return json.loads(resp.choices[0].message.content)
-    except Exception:
-         print("OpenAI extraction error:", e)
-        return {"requirements":[],"global_location":None}
+    except Exception as e:
+        print("OpenAI extraction error:", e)
+        return {"requirements": [], "global_location": None}
+
 
 # ========== Google Places ==========
 BASE_URL = "https://maps.googleapis.com/maps/api/place"
