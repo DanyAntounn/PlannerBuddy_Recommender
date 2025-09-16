@@ -11,8 +11,8 @@ from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from fuzzywuzzy import fuzz
 
-OPENAI_API_KEY = "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"
-GOOGLE_API_KEY = "AIzaSyCSWMWno-RiGOWlkswcmoa8Q11VocfPcNs"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getebnv("GOOGLE_API_KEY")
 
 sia = SentimentIntensityAnalyzer()
 lemmatizer = WordNetLemmatizer()
