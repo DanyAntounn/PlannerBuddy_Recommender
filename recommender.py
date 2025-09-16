@@ -71,6 +71,7 @@ def extract_requirements_with_openai(user_query: str) -> dict:
         )
         return json.loads(resp.choices[0].message.content)
     except Exception:
+         print("OpenAI extraction error:", e)
         return {"requirements":[],"global_location":None}
 
 # ========== Google Places ==========
