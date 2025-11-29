@@ -29,6 +29,12 @@ class AutoTripRequest(BaseModel):
     user_act: UserProfile
     location: str = "Beirut, Lebanon"
 
+@app.get("/enrich_firestore")
+def enrich_firestore():
+    enrich_collection_with_profiles_from_firestore("RestaurantsFinal", "food")
+    enrich_collection_with_profiles_from_firestore("ActivitiesFinal", "activity")
+    return {"status": "OK"}
+
 @app.post("/auto-trip")
 def auto_trip(req: AutoTripRequest):
     res = auto_trip_generate(req.user_food.dict(), req.user_act.dict(), req.location)
