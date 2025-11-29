@@ -10,10 +10,11 @@ from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from fuzzywuzzy import fuzz
+from google.cloud import firestore
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
+db = firestore.Client()
 sia = SentimentIntensityAnalyzer()
 lemmatizer = WordNetLemmatizer()
 stop_words = set(stopwords.words("english") + list(string.punctuation))
@@ -222,3 +223,80 @@ def custom_trip_generate(query,user_food,user_act,location="Beirut, Lebanon"):
         ranked=rank_places(user_food if typ=="restaurant" else user_act,raw,typ,count,kw)
         plan.append({"requirement":req,"recommendations":ranked})
     return {"extracted":extraction,"plan":plan}
+
+def build_place_dict_from_firestore_doc(doc_data: dict) -> dict:
+    """
+    Convert a Firestore restaurant/activity doc into the dict shape
+    expected by extract_place_profile (name, rating, user_ratings_total, reviews, types, address).
+    """
+    reviews = doc_data.get("reviews") or []
+    # You didn't store rating / user_ratings_total in Firestore yet, so we approximate:
+    rating = doc_data.get("rating", 0.0) or 0.0
+    num_reviews = doc_data.get("num_reviews") or len(reviews)
+
+    return {
+        "name": doc_data.get("name", "Unknown"),
+        "address": doc_data.get("address", "N/A"),
+        "rating": rating,
+        "user_ratings_total": num_reviews,
+        "reviews": reviews,
+        "types": doc_data.get("types", []),
+    }
+
+
+def enrich_collection_with_profiles_from_firestore(collection_name: str, recommendation_type: str):
+    """
+    Enrich each document in a Firestore collection (RestaurantsFinal / ActivitiesFinal)
+    using ONLY the reviews that are already stored in Firestore.
+
+    recommendation_type: "food" for restaurants, "activity" for activities.
+    """
+    print(f"=== Enriching collection: {collection_name} (type={recommendation_type}) ===")
+
+    docs = db.collection(collection_name).stream()
+    processed = 0
+    skipped_no_reviews = 0
+
+    for snap in docs:
+        doc_id = snap.id
+        data = snap.to_dict() or {}
+
+        # Skip if there are no reviews stored at all
+        reviews = data.get("reviews") or []
+        if not reviews:
+            skipped_no_reviews += 1
+            continue
+
+        # Optional: skip if already enriched (idempotent)
+        if "avg_sentiment" in data and "primary_features" in data:
+            continue
+
+        print(f"\n[Doc {doc_id}] name={data.get('name')} - {len(reviews)} reviews")
+
+        # Build a fake "place_dict" as if it came from Google Places,
+        # but using only the Firestore fields.
+        place_dict = build_place_dict_from_firestore_doc(data)
+
+        # Use your EXISTING extractor
+        profile = extract_place_profile(place_dict, recommendation_type)
+
+        update_data = {
+            "avg_sentiment": profile["avg_sentiment"],
+            "primary_features": profile["primary_features"],
+            "secondary_features": profile["secondary_features"],
+            "ambiance": profile["ambiance"],
+            "rating": profile["rating"],          # may be 0.0 if you never stored rating
+            "num_reviews": profile["num_reviews"],
+            "address": profile["address"],
+            "types": profile["types"],
+            # keep reviews field as is (already in Firestore)
+        }
+
+        db.collection(collection_name).document(doc_id).set(update_data, merge=True)
+        processed += 1
+        print(f"   -> Updated Firestore doc {doc_id} with NLP profile.")
+
+    print("\n=== Summary for", collection_name, "===")
+    print("Processed docs:", processed)
+    print("Skipped (no reviews):", skipped_no_reviews)
+    print("====================================\n")
