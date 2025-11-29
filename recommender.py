@@ -114,28 +114,36 @@ class GooglePlacesService:
             return {"name":res.get("name"),"address":res.get("formatted_address"),
                     "rating":res.get("rating"),"user_ratings_total":res.get("user_ratings_total"),
                     "reviews":reviews,"types":res.get("types",[])}
-        except: return None
+        except:
+            return None
 
     def text_search(self, query, location_str, place_type=None, max_pages=1):
         all_results, token, page = [], None, 0
         while page<max_pages:
             url = f"{BASE_URL}/textsearch/json?query={requests.utils.quote(query+' in '+location_str)}&key={self.api_key}"
-            if place_type: url += f"&type={place_type}"
-            if token: url += f"&pagetoken={token}"; time.sleep(2)
+            if place_type:
+                url += f"&type={place_type}"
+            if token:
+                url += f"&pagetoken={token}"
+                time.sleep(2)
             data = self.session.get(url).json()
-            if data.get("status")!="OK": break
+            if data.get("status")!="OK":
+                break
             for p in data["results"]:
                 detail = self._details(p["place_id"])
-                if detail: all_results.append(detail)
-            token=data.get("next_page_token"); page+=1
-            if not token: break
+                if detail:
+                    all_results.append(detail)
+            token = data.get("next_page_token")
+            page += 1
+            if not token:
+                break
         return all_results
 
-places_service=GooglePlacesService()
+places_service = GooglePlacesService()
 
 # ========== NLP scoring ==========
 def fuzzy_in(text, needle, thresh=85):
-    return fuzz.partial_ratio(text.lower(), needle.lower())>=thresh
+    return fuzz.partial_ratio(text.lower(), needle.lower()) >= thresh
 
 def extract_place_profile(place_dict, recommendation_type: str):
     reviews = place_dict.get("reviews", []) or []
@@ -143,6 +151,7 @@ def extract_place_profile(place_dict, recommendation_type: str):
     num_reviews = place_dict.get("user_ratings_total", 0) or 0
     review_blob = " ".join([r for r in reviews if isinstance(r, str)])[:20000]
     tokens = preprocess_text(review_blob)
+
     if recommendation_type == "food":
         primary_keywords = FOOD_CUISINE_KEYWORDS
         secondary_keywords = FOOD_ACTIVITY_KEYWORDS
@@ -151,17 +160,25 @@ def extract_place_profile(place_dict, recommendation_type: str):
         primary_keywords = ACTIVITY_TYPE_KEYWORDS
         secondary_keywords = ACTIVITY_TYPE_KEYWORDS
         ambiance_keywords = ACTIVITY_AMBIANCE_KEYWORDS
+
     def pick_matches(candidates):
         found = set()
         for kw in candidates:
             if kw in tokens or fuzzy_in(review_blob, kw, 88):
                 found.add(kw)
         return list(found)
+
     primary_found = pick_matches(primary_keywords)
     secondary_found = pick_matches(secondary_keywords)
     ambiance_found = pick_matches(ambiance_keywords)
-    sentiments = [sia.polarity_scores(r)["compound"] for r in reviews if isinstance(r, str) and r.strip()]
+
+    sentiments = [
+        sia.polarity_scores(r)["compound"]
+        for r in reviews
+        if isinstance(r, str) and r.strip()
+    ]
     avg_sentiment = float(np.mean(sentiments)) if sentiments else 0.0
+
     return {
         "name": place_dict.get("name", "Unknown"),
         "avg_sentiment": avg_sentiment,
@@ -193,28 +210,34 @@ def build_flutter_payload(plan_steps):
     return out
 
 def match_user_to_place(profile, place_profile, typ):
-    score=0
-    if any(f in place_profile["primary_features"] for f in profile["preferred_primary_features"]): score+=5
-    score+=len(set(profile["ambiance"])&set(place_profile["ambiance"]))*3
-    score+=len(set(profile["preferred_secondary_features"])&set(place_profile["secondary_features"]))*2
-    if place_profile["avg_sentiment"]>0.3: score+=3
-    if place_profile["rating"]>=profile["rating_threshold"]: score+=4
-    if place_profile["num_reviews"]>=profile["min_reviews_count"]: score+=2
+    score = 0
+    if any(f in place_profile["primary_features"] for f in profile["preferred_primary_features"]):
+        score += 5
+    score += len(set(profile["ambiance"]) & set(place_profile["ambiance"])) * 3
+    score += len(set(profile["preferred_secondary_features"]) & set(place_profile["secondary_features"])) * 2
+    if place_profile["avg_sentiment"] > 0.3:
+        score += 3
+    if place_profile["rating"] >= profile["rating_threshold"]:
+        score += 4
+    if place_profile["num_reviews"] >= profile["min_reviews_count"]:
+        score += 2
     return score
 
 def rank_places(profile, places, typ, top_n, query):
-    q_tokens=preprocess_text(query)
-    scored=[]
+    q_tokens = preprocess_text(query)
+    scored = []
     for p in places:
-        pp=extract_place_profile(p,typ)
-        s=match_user_to_place(profile,pp,typ)
-        if any(qt in pp["primary_features"]+pp["secondary_features"] for qt in q_tokens): s+=4
-        scored.append({"name":pp["name"],"score":s,"profile":pp})
-    return sorted(scored,key=lambda x:x["score"],reverse=True)[:top_n]
+        pp = extract_place_profile(p, typ)
+        s = match_user_to_place(profile, pp, typ)
+        if any(qt in pp["primary_features"] + pp["secondary_features"] for qt in q_tokens):
+            s += 4
+        scored.append({"name": pp["name"], "score": s, "profile": pp})
+    return sorted(scored, key=lambda x: x["score"], reverse=True)[:top_n]
 
-# ========== Planner ==========
+# ========== Planner (Google Places based) ==========
 def auto_trip_generate(user_food, user_act, location="Beirut, Lebanon"):
     plan = []
+
     food_kw = " ".join(user_food.get("preferred_primary_features", [])[:2]) or "restaurant"
     raw_food = places_service.text_search(food_kw, location, place_type="restaurant")
     ranked_food = rank_places(user_food, raw_food, "food", top_n=1, query=food_kw)
@@ -222,6 +245,7 @@ def auto_trip_generate(user_food, user_act, location="Beirut, Lebanon"):
         "requirement": {"type": "restaurant", "count": 1, "keywords": [food_kw], "location_hint": location},
         "recommendations": ranked_food
     })
+
     act_kw = " ".join(user_act.get("preferred_primary_features", [])[:3]) or "attraction"
     raw_act = places_service.text_search(act_kw, location, place_type=None)
     ranked_act = rank_places(user_act, raw_act, "activity", top_n=2, query=act_kw)
@@ -231,24 +255,26 @@ def auto_trip_generate(user_food, user_act, location="Beirut, Lebanon"):
     })
     return {"plan": plan}
 
-def custom_trip_generate(query,user_food,user_act,location="Beirut, Lebanon"):
-    extraction=extract_requirements_with_openai(query)
-    plan=[]
+def custom_trip_generate(query, user_food, user_act, location="Beirut, Lebanon"):
+    extraction = extract_requirements_with_openai(query)
+    plan = []
     for req in extraction["requirements"]:
-        typ=req["type"]; kw=" ".join(req["keywords"]) or typ
-        count=req.get("count",1); loc=req.get("location_hint") or extraction.get("global_location") or location
-        raw=places_service.text_search(kw,loc,"restaurant" if typ=="restaurant" else None)
-        ranked=rank_places(user_food if typ=="restaurant" else user_act,raw,typ,count,kw)
-        plan.append({"requirement":req,"recommendations":ranked})
-    return {"extracted":extraction,"plan":plan}
+        typ = req["type"]
+        kw = " ".join(req["keywords"]) or typ
+        count = req.get("count", 1)
+        loc = req.get("location_hint") or extraction.get("global_location") or location
+        raw = places_service.text_search(kw, loc, "restaurant" if typ == "restaurant" else None)
+        ranked = rank_places(user_food if typ == "restaurant" else user_act, raw, typ, count, kw)
+        plan.append({"requirement": req, "recommendations": ranked})
+    return {"extracted": extraction, "plan": plan}
 
+# ========== Firestore enrichment (already used) ==========
 def build_place_dict_from_firestore_doc(doc_data: dict) -> dict:
     """
     Convert a Firestore restaurant/activity doc into the dict shape
     expected by extract_place_profile (name, rating, user_ratings_total, reviews, types, address).
     """
     reviews = doc_data.get("reviews") or []
-    # You didn't store rating / user_ratings_total in Firestore yet, so we approximate:
     rating = doc_data.get("rating", 0.0) or 0.0
     num_reviews = doc_data.get("num_reviews") or len(reviews)
 
@@ -260,7 +286,6 @@ def build_place_dict_from_firestore_doc(doc_data: dict) -> dict:
         "reviews": reviews,
         "types": doc_data.get("types", []),
     }
-
 
 def enrich_collection_with_profiles_from_firestore(collection_name: str, recommendation_type: str):
     """
@@ -303,7 +328,7 @@ def enrich_collection_with_profiles_from_firestore(collection_name: str, recomme
             "primary_features": profile["primary_features"],
             "secondary_features": profile["secondary_features"],
             "ambiance": profile["ambiance"],
-            "rating": profile["rating"],          # may be 0.0 if you never stored rating
+            "rating": profile["rating"],
             "num_reviews": profile["num_reviews"],
             "address": profile["address"],
             "types": profile["types"],
@@ -318,3 +343,120 @@ def enrich_collection_with_profiles_from_firestore(collection_name: str, recomme
     print("Processed docs:", processed)
     print("Skipped (no reviews):", skipped_no_reviews)
     print("====================================\n")
+
+# ========== NEW: Firestore-based ranking (no live Google calls) ==========
+def build_profile_from_firestore_doc(doc_data: dict, recommendation_type: str):
+    """
+    Build a place_profile in the same shape as extract_place_profile(),
+    but using fields already stored in Firestore after enrichment.
+    """
+    reviews = doc_data.get("reviews") or []
+    rating = float(doc_data.get("rating", 0.0) or 0.0)
+    num_reviews = int(doc_data.get("num_reviews") or len(reviews))
+
+    return {
+        "name": doc_data.get("name", "Unknown"),
+        "avg_sentiment": float(doc_data.get("avg_sentiment", 0.0) or 0.0),
+        "primary_features": doc_data.get("primary_features", []),
+        "secondary_features": doc_data.get("secondary_features", []),
+        "ambiance": doc_data.get("ambiance", []),
+        "rating": rating,
+        "num_reviews": num_reviews,
+        "address": doc_data.get("address", "N/A"),
+        "types": doc_data.get("types", []),
+        "raw": doc_data,
+    }
+
+def rank_places_from_firestore(
+    collection_name: str,
+    user_profile: dict,
+    recommendation_type: str,
+    top_n: int,
+    query: str = ""
+):
+    """
+    Read all docs from `collection_name`, build place_profile from stored fields,
+    score them against user_profile, and return the top_n.
+    """
+    docs = db.collection(collection_name).stream()
+    q_tokens = preprocess_text(query)
+    scored = []
+
+    for snap in docs:
+        data = snap.to_dict() or {}
+
+        # Only consider docs that were enriched
+        if "primary_features" not in data or "avg_sentiment" not in data:
+            continue
+
+        place_profile = build_profile_from_firestore_doc(data, recommendation_type)
+        s = match_user_to_place(user_profile, place_profile, recommendation_type)
+
+        # Optional query boost (similar to rank_places)
+        if q_tokens:
+            combined_features = place_profile["primary_features"] + place_profile["secondary_features"]
+            if any(qt in combined_features for qt in q_tokens):
+                s += 4
+
+        scored.append({
+            "name": place_profile["name"],
+            "score": float(s),
+            "profile": place_profile,
+            "doc_id": snap.id,
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_n]
+
+def firestore_trip_generate(
+    user_food: dict,
+    user_act: dict,
+    num_restaurants: int = 1,
+    num_activities: int = 2,
+    location: str = "Beirut, Lebanon"
+):
+    """
+    Use ONLY Firestore-enriched data (RestaurantsFinal, ActivitiesFinal)
+    to pick the best restaurants and activities for the given user profiles.
+    """
+    plan = []
+
+    # Restaurants
+    food_kw = " ".join(user_food.get("preferred_primary_features", [])[:2]) or "restaurant"
+    top_restaurants = rank_places_from_firestore(
+        collection_name="RestaurantsFinal",
+        user_profile=user_food,
+        recommendation_type="food",
+        top_n=num_restaurants,
+        query=food_kw,
+    )
+    plan.append({
+        "requirement": {
+            "type": "restaurant",
+            "count": num_restaurants,
+            "keywords": [food_kw],
+            "location_hint": location,
+        },
+        "recommendations": top_restaurants,
+    })
+
+    # Activities
+    act_kw = " ".join(user_act.get("preferred_primary_features", [])[:3]) or "activity"
+    top_activities = rank_places_from_firestore(
+        collection_name="ActivitiesFinal",
+        user_profile=user_act,
+        recommendation_type="activity",
+        top_n=num_activities,
+        query=act_kw,
+    )
+    plan.append({
+        "requirement": {
+            "type": "activity",
+            "count": num_activities,
+            "keywords": [act_kw],
+            "location_hint": location,
+        },
+        "recommendations": top_activities,
+    })
+
+    return {"plan": plan}
