@@ -1,7 +1,7 @@
 # app.py
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
-from recommender import custom_trip_generate, auto_trip_generate, build_flutter_payload
+from recommender import custom_trip_generate, auto_trip_generate, build_flutter_payload, enrich_collection_with_profiles_from_firestore
 
 app = FastAPI(title="Trip Planner API")
 
