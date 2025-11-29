@@ -75,11 +75,15 @@ class FirestoreTripRequest(BaseModel):
 
 @app.post("/firestore-trip")
 def firestore_trip(req: FirestoreTripRequest):
+    # Enforce sane defaults if someone passes 0 or negative values
+    num_restaurants = req.num_restaurants if req.num_restaurants > 0 else 1
+    num_activities = req.num_activities if req.num_activities > 0 else 2
+
     res = firestore_trip_generate(
         req.user_food.dict(),
         req.user_act.dict(),
-        num_restaurants=req.num_restaurants,
-        num_activities=req.num_activities,
+        num_restaurants=num_restaurants,
+        num_activities=num_activities,
         location=req.location,
     )
     flutter_payload = build_flutter_payload(res["plan"])
