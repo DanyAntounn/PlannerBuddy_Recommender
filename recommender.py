@@ -2,7 +2,7 @@ import nltk
 # Ensure NLTK uses Docker-installed data
 nltk.data.path.append("/usr/local/nltk_data")
 
-import os, time, json, requests, string
+import os, time, json, requests, string, base64
 import numpy as np
 from openai import OpenAI
 from nltk.sentiment import SentimentIntensityAnalyzer
@@ -14,7 +14,28 @@ from google.cloud import firestore
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-db = firestore.Client()
+
+# -------- Firestore client setup (fixed) --------
+def get_firestore_client():
+    """
+    1) If FIRESTORE_CREDENTIALS is set (base64 service-account JSON), use that.
+    2) Otherwise, fall back to GOOGLE_APPLICATION_CREDENTIALS file path.
+    """
+    b64 = os.getenv("FIRESTORE_CREDENTIALS")
+    if b64:
+        try:
+            info = json.loads(base64.b64decode(b64))
+            creds = service_account.Credentials.from_service_account_info(info)
+            return firestore.Client(credentials=creds, project=info["project_id"])
+        except Exception as e:
+            print("Error loading Firestore credentials from FIRESTORE_CREDENTIALS:", e)
+            raise
+
+    # Fallback: standard ADC using GOOGLE_APPLICATION_CREDENTIALS
+    # (works locally if you do: set GOOGLE_APPLICATION_CREDENTIALS=path\to\service-account.json)
+    return firestore.Client()
+
+db = get_firestore_client()
 sia = SentimentIntensityAnalyzer()
 lemmatizer = WordNetLemmatizer()
 stop_words = set(stopwords.words("english") + list(string.punctuation))
