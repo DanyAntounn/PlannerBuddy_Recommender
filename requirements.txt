@@ -6,3 +6,4 @@ requests
 openai
 fuzzywuzzy
 python-Levenshtein
+google-cloud-firestore
