@@ -16,27 +16,23 @@ from google.oauth2 import service_account
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# -------- Firestore client setup (fixed) --------
+# -------- Firestore client setup using Render Secret File --------
 def get_firestore_client():
-    """
-    1) If FIRESTORE_CREDENTIALS is set (base64 service-account JSON), use that.
-    2) Otherwise, fall back to GOOGLE_APPLICATION_CREDENTIALS file path.
-    """
-    b64 = os.getenv("FIRESTORE_CREDENTIALS")
-    if b64:
-        try:
-            info = json.loads(base64.b64decode(b64))
-            creds = service_account.Credentials.from_service_account_info(info)
-            return firestore.Client(credentials=creds, project=info["project_id"])
-        except Exception as e:
-            print("Error loading Firestore credentials from FIRESTORE_CREDENTIALS:", e)
-            raise
+    # Path where Render mounts the secret file
+    secret_path = "/etc/secrets/service-account.json"
 
-    # Fallback: standard ADC using GOOGLE_APPLICATION_CREDENTIALS
-    # (works locally if you do: set GOOGLE_APPLICATION_CREDENTIALS=path\to\service-account.json)
+    if os.path.exists(secret_path):
+        with open(secret_path, "r") as f:
+            info = json.load(f)
+
+        creds = service_account.Credentials.from_service_account_info(info)
+        return firestore.Client(credentials=creds, project=info["project_id"])
+
+    # Fallback for local dev if you set GOOGLE_APPLICATION_CREDENTIALS
     return firestore.Client()
 
 db = get_firestore_client()
+
 sia = SentimentIntensityAnalyzer()
 lemmatizer = WordNetLemmatizer()
 stop_words = set(stopwords.words("english") + list(string.punctuation))
