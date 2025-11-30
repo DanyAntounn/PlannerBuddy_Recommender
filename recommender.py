@@ -12,6 +12,7 @@ from nltk.stem import WordNetLemmatizer
 from fuzzywuzzy import fuzz
 from google.cloud import firestore
 from google.oauth2 import service_account
+from google.cloud.firestore_v1 import GeoPoint
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -198,16 +199,28 @@ def build_flutter_payload(plan_steps):
         req = step["requirement"]
         places = []
         for rec in step["recommendations"]:
-            places.append({
+            profile = rec["profile"]
+            place_entry = {
                 "name": rec["name"],
                 "score": round(float(rec["score"]), 2),
-                "rating": float(rec["profile"]["rating"] or 0.0),
-            })
+                "rating": float(profile["rating"] or 0.0),
+            }
+
+            # NEW: include coordinates if available in profile
+            lat = profile.get("latitude")
+            lon = profile.get("longitude")
+            if lat is not None and lon is not None:
+                place_entry["latitude"] = lat
+                place_entry["longitude"] = lon
+
+            places.append(place_entry)
+
         out.append({
             "requirement": req,
             "places": places
         })
     return out
+
 
 def match_user_to_place(profile, place_profile, typ):
     score = 0
@@ -344,15 +357,28 @@ def enrich_collection_with_profiles_from_firestore(collection_name: str, recomme
     print("Skipped (no reviews):", skipped_no_reviews)
     print("====================================\n")
 
-# ========== NEW: Firestore-based ranking (no live Google calls) ==========
 def build_profile_from_firestore_doc(doc_data: dict, recommendation_type: str):
     """
     Build a place_profile in the same shape as extract_place_profile(),
     but using fields already stored in Firestore after enrichment.
+    Also extracts latitude/longitude from the `location` GeoPoint if present.
     """
     reviews = doc_data.get("reviews") or []
     rating = float(doc_data.get("rating", 0.0) or 0.0)
     num_reviews = int(doc_data.get("num_reviews") or len(reviews))
+
+    # Try to extract GeoPoint from Firestore "location" field
+    latitude = None
+    longitude = None
+    loc = doc_data.get("location")
+    if isinstance(loc, GeoPoint):
+        latitude = loc.latitude
+        longitude = loc.longitude
+    else:
+        # In case you ever store it as a dict manually
+        if isinstance(loc, dict):
+            latitude = loc.get("latitude")
+            longitude = loc.get("longitude")
 
     return {
         "name": doc_data.get("name", "Unknown"),
@@ -364,8 +390,11 @@ def build_profile_from_firestore_doc(doc_data: dict, recommendation_type: str):
         "num_reviews": num_reviews,
         "address": doc_data.get("address", "N/A"),
         "types": doc_data.get("types", []),
+        "latitude": latitude,
+        "longitude": longitude,
         "raw": doc_data,
     }
+
 
 def rank_places_from_firestore(
     collection_name: str,
@@ -413,11 +442,15 @@ def firestore_trip_generate(
     user_act: dict,
     num_restaurants: int = 1,
     num_activities: int = 2,
-    location: str = "Beirut, Lebanon"
+    location: str = "Beirut, Lebanon",
+    user_latitude: float | None = None,
+    user_longitude: float | None = None,
 ):
     """
     Use ONLY Firestore-enriched data (RestaurantsFinal, ActivitiesFinal)
     to pick the best restaurants and activities for the given user profiles.
+
+    user_latitude / user_longitude are accepted for future distance-based logic.
     """
     plan = []
 
@@ -459,4 +492,7 @@ def firestore_trip_generate(
         "recommendations": top_activities,
     })
 
+    # For now we ignore user_latitude / user_longitude,
+    # but they are available here when you want to add distance scoring.
     return {"plan": plan}
+
