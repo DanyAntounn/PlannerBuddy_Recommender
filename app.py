@@ -63,19 +63,22 @@ def enrich_firestore():
     return {"status": "OK"}
 
 
-# ===== NEW: Firestore-based trip endpoint (no live Google Places) =====
+# ===== Firestore-based trip endpoint =====
 
 class FirestoreTripRequest(BaseModel):
     user_food: UserProfile
     user_act: UserProfile
+    # Defaults: 1 restaurant, 2 activities
     num_restaurants: int = 1
     num_activities: int = 2
     location: str = "Beirut, Lebanon"
+    # NEW: user location (optional, for later use)
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 @app.post("/firestore-trip")
 def firestore_trip(req: FirestoreTripRequest):
-    # Enforce sane defaults if someone passes 0 or negative values
     num_restaurants = req.num_restaurants if req.num_restaurants > 0 else 1
     num_activities = req.num_activities if req.num_activities > 0 else 2
 
@@ -85,6 +88,8 @@ def firestore_trip(req: FirestoreTripRequest):
         num_restaurants=num_restaurants,
         num_activities=num_activities,
         location=req.location,
+        user_latitude=req.latitude,
+        user_longitude=req.longitude,
     )
     flutter_payload = build_flutter_payload(res["plan"])
     return {"plan": flutter_payload}
