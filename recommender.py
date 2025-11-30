@@ -200,13 +200,14 @@ def build_flutter_payload(plan_steps):
         places = []
         for rec in step["recommendations"]:
             profile = rec["profile"]
+
             place_entry = {
                 "name": rec["name"],
                 "score": round(float(rec["score"]), 2),
                 "rating": float(profile["rating"] or 0.0),
             }
 
-            # NEW: include coordinates if available in profile
+            # NEW: include lat/long from Firestore profile if available
             lat = profile.get("latitude")
             lon = profile.get("longitude")
             if lat is not None and lon is not None:
@@ -220,6 +221,7 @@ def build_flutter_payload(plan_steps):
             "places": places
         })
     return out
+
 
 
 def match_user_to_place(profile, place_profile, typ):
@@ -367,16 +369,19 @@ def build_profile_from_firestore_doc(doc_data: dict, recommendation_type: str):
     rating = float(doc_data.get("rating", 0.0) or 0.0)
     num_reviews = int(doc_data.get("num_reviews") or len(reviews))
 
-    # Try to extract GeoPoint from Firestore "location" field
+    # Extract GeoPoint from Firestore "location" field
     latitude = None
     longitude = None
     loc = doc_data.get("location")
-    if isinstance(loc, GeoPoint):
-        latitude = loc.latitude
-        longitude = loc.longitude
-    else:
-        # In case you ever store it as a dict manually
-        if isinstance(loc, dict):
+
+    # Firestore GeoPoint object (google.cloud.firestore_v1._helpers.GeoPoint)
+    if loc is not None:
+        # Robust: support GeoPoint object or dict
+        if hasattr(loc, "latitude") and hasattr(loc, "longitude"):
+            latitude = loc.latitude
+            longitude = loc.longitude
+        elif isinstance(loc, dict):
+            # In case it was stored manually as a dict
             latitude = loc.get("latitude")
             longitude = loc.get("longitude")
 
@@ -394,6 +399,7 @@ def build_profile_from_firestore_doc(doc_data: dict, recommendation_type: str):
         "longitude": longitude,
         "raw": doc_data,
     }
+
 
 
 def rank_places_from_firestore(
