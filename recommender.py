@@ -225,29 +225,37 @@ def build_flutter_payload(plan_steps):
 
 
 def match_user_to_place(profile, place_profile, typ):
+    # Safely extract values from profile, even if it's {}
+    preferred_primary = profile.get("preferred_primary_features", [])
+    ambiance_pref = profile.get("ambiance", [])
+    preferred_secondary = profile.get("preferred_secondary_features", [])
+    rating_threshold = profile.get("rating_threshold", 0.0)
+    min_reviews_count = profile.get("min_reviews_count", 0)
+
     score = 0
-    if any(f in place_profile["primary_features"] for f in profile["preferred_primary_features"]):
+
+    # Primary feature match
+    if any(f in place_profile["primary_features"] for f in preferred_primary):
         score += 5
-    score += len(set(profile["ambiance"]) & set(place_profile["ambiance"])) * 3
-    score += len(set(profile["preferred_secondary_features"]) & set(place_profile["secondary_features"])) * 2
+
+    # Ambiance overlap
+    score += len(set(ambiance_pref) & set(place_profile["ambiance"])) * 3
+
+    # Secondary feature overlap
+    score += len(set(preferred_secondary) & set(place_profile["secondary_features"])) * 2
+
+    # Sentiment
     if place_profile["avg_sentiment"] > 0.3:
         score += 3
-    if place_profile["rating"] >= profile["rating_threshold"]:
+
+    # Rating & number of reviews
+    if place_profile["rating"] >= rating_threshold:
         score += 4
-    if place_profile["num_reviews"] >= profile["min_reviews_count"]:
+    if place_profile["num_reviews"] >= min_reviews_count:
         score += 2
+
     return score
 
-def rank_places(profile, places, typ, top_n, query):
-    q_tokens = preprocess_text(query)
-    scored = []
-    for p in places:
-        pp = extract_place_profile(p, typ)
-        s = match_user_to_place(profile, pp, typ)
-        if any(qt in pp["primary_features"] + pp["secondary_features"] for qt in q_tokens):
-            s += 4
-        scored.append({"name": pp["name"], "score": s, "profile": pp})
-    return sorted(scored, key=lambda x: x["score"], reverse=True)[:top_n]
 
 # ========== Planner (Google Places based) ==========
 def auto_trip_generate(user_food, user_act, location="Beirut, Lebanon"):
