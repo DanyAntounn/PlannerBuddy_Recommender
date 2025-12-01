@@ -1,6 +1,7 @@
 # app.py
 from fastapi import FastAPI
 from pydantic import BaseModel
+from typing import Optional
 
 from recommender import (
     custom_trip_generate,
@@ -22,21 +23,28 @@ class UserProfile(BaseModel):
 
 class CustomTripRequest(BaseModel):
     query: str
-    user_food: UserProfile
-    user_act: UserProfile
+    user_food: Optional[UserProfile] = None
+    user_act: Optional[UserProfile] = None
     location: str = "Beirut, Lebanon"
 
 
 @app.post("/custom-trip")
 def custom_trip(req: CustomTripRequest):
+
+    # user_food / user_act may be None (because Flutter didn't send them)
+    user_food = req.user_food.dict() if req.user_food else {}
+    user_act = req.user_act.dict() if req.user_act else {}
+
     res = custom_trip_generate(
         req.query,
-        req.user_food.dict(),
-        req.user_act.dict(),
+        user_food,
+        user_act,
         req.location,
     )
+
     flutter_payload = build_flutter_payload(res["plan"])
     return {"extracted": res["extracted"], "plan": flutter_payload}
+
 
 
 class AutoTripRequest(BaseModel):
