@@ -118,7 +118,6 @@ class GooglePlacesService:
         self.session = requests.Session()
 
     def _details(self, place_id):
-        # NEW: include place_id, photos, geometry for lat/lon
         url = (
             f"{BASE_URL}/details/json"
             f"?place_id={place_id}"
@@ -180,16 +179,19 @@ class GooglePlacesService:
 
 places_service = GooglePlacesService()
 
-def find_place_id_by_name_address(name: str, address: str, fallback_location: str = "Lebanon") -> str | None:
+# =========================
+# FIX: use google_place_id (Firestore) + name-only fallback
+# =========================
+def find_google_place_id_by_name(name: str, fallback_location: str = "Lebanon") -> str | None:
     """
-    If a Firestore doc doesn't have place_id, try to find it via Google Places Text Search.
-    Keeps it lightweight: 1 page.
+    If a Firestore doc doesn't have google_place_id, try to find it via Google Places Text Search (name only).
     """
     if not name:
         return None
-    q = name
-    if address:
-        q = f"{name} {address}"
+    q = str(name).strip()
+    if not q:
+        return None
+
     try:
         results = places_service.text_search(q, fallback_location, place_type=None, max_pages=1)
         if results:
@@ -208,21 +210,22 @@ def ensure_image_url_for_firestore_doc(
     if place_profile.get("image_url"):
         return place_profile["image_url"]
 
-    place_id = place_profile.get("place_id")
+    # FIX: read google_place_id (not place_id)
+    google_place_id = place_profile.get("google_place_id")
 
-    # If no place_id, try to recover it (expensive + possibly wrong)
-    if not place_id:
-        name = place_profile.get("name", "")
-        address = place_profile.get("address", "")
-        if name and address:  # only do it when we have both
-            place_id = find_place_id_by_name_address(name, address, fallback_location="Lebanon")
-            if place_id:
-                place_profile["place_id"] = place_id
+    # If no google_place_id, fallback: name only (as requested)
+    if not google_place_id:
+        google_place_id = find_google_place_id_by_name(
+            place_profile.get("name", ""),
+            fallback_location="Lebanon",
+        )
+        if google_place_id:
+            place_profile["google_place_id"] = google_place_id
 
-    if not place_id:
+    if not google_place_id:
         return None
 
-    details = places_service._details(place_id)
+    details = places_service._details(google_place_id)
     if not details:
         return None
 
@@ -230,9 +233,9 @@ def ensure_image_url_for_firestore_doc(
 
     update_data = {}
 
-    # Save place_id if missing
-    if not place_profile.get("place_id") and place_id:
-        update_data["place_id"] = place_id
+    # Save google_place_id if we found it (or it exists)
+    if place_profile.get("google_place_id"):
+        update_data["google_place_id"] = place_profile["google_place_id"]
 
     # Save image_url if found
     if image_url:
@@ -324,7 +327,6 @@ def build_flutter_payload(plan_steps):
                 place_entry["latitude"] = lat
                 place_entry["longitude"] = lon
 
-            # NEW: image_url support
             img = profile.get("image_url")
             if img:
                 place_entry["image_url"] = img
@@ -371,7 +373,6 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return R * c
 
 def distance_bias_bonus(user_lat, user_lon, place_lat, place_lon) -> float:
-    # Gentle bias only. Max +1.5
     if user_lat is None or user_lon is None or place_lat is None or place_lon is None:
         return 0.0
     d = haversine_km(user_lat, user_lon, place_lat, place_lon)
@@ -445,8 +446,9 @@ def build_profile_from_firestore_doc(doc_data: dict, recommendation_type: str):
         "types": doc_data.get("types", []),
         "latitude": latitude,
         "longitude": longitude,
-        "image_url": doc_data.get("image_url"),   # NEW
-        "place_id": doc_data.get("place_id"),     # NEW
+        "image_url": doc_data.get("image_url"),
+        # FIX: read google_place_id from Firestore
+        "google_place_id": doc_data.get("google_place_id"),
         "raw": doc_data,
     }
 
@@ -469,7 +471,8 @@ def upsert_place_into_firestore(collection_name: str, place_details: dict, recom
         "num_reviews": int(place_details.get("user_ratings_total") or 0),
         "reviews": place_details.get("reviews") or [],
         "types": place_details.get("types") or [],
-        "place_id": place_id,
+        # FIX: store google_place_id (not place_id) for your schema
+        "google_place_id": place_id,
     }
 
     lat = place_details.get("latitude")
@@ -480,7 +483,6 @@ def upsert_place_into_firestore(collection_name: str, place_details: dict, recom
     if image_url:
         update_data["image_url"] = image_url
 
-    # Enrich immediately using your existing extractor
     profile = extract_place_profile(place_details, recommendation_type)
     update_data.update({
         "avg_sentiment": profile["avg_sentiment"],
@@ -503,15 +505,6 @@ def rank_places_from_firestore(
     force_location: bool = False,
     location_hint: str | None = None,
 ):
-    """
-    Firestore scoring with:
-    - your profile score
-    - optional query boost
-    - SMALL distance bias (unless force_location)
-    - optional lightweight location_hint filter if force_location=True
-    - diversity rerank
-    - NEW: if picked docs have no image_url, fetch via Google Places + update Firestore + return it
-    """
     docs = db.collection(collection_name).stream()
     q_tokens = preprocess_text(query)
     scored = []
@@ -521,11 +514,9 @@ def rank_places_from_firestore(
     for snap in docs:
         data = snap.to_dict() or {}
 
-        # only consider enriched docs
         if "primary_features" not in data or "avg_sentiment" not in data:
             continue
 
-        # If query forces a location, do a lightweight filter (no schema assumptions)
         if force_location and loc_lower:
             addr = (data.get("address") or "").lower()
             name = (data.get("name") or "").lower()
@@ -535,13 +526,11 @@ def rank_places_from_firestore(
         place_profile = build_profile_from_firestore_doc(data, recommendation_type)
         s = match_user_to_place(user_profile, place_profile, recommendation_type)
 
-        # query boost
         if q_tokens:
             combined_features = place_profile["primary_features"] + place_profile["secondary_features"]
             if any(qt in combined_features for qt in q_tokens):
                 s += 4
 
-        # small distance bias unless forced location
         if not force_location:
             s += distance_bias_bonus(
                 user_latitude, user_longitude,
@@ -555,28 +544,23 @@ def rank_places_from_firestore(
             "doc_id": snap.id,
         })
 
-    # Sort then diversify
     scored.sort(key=lambda x: x["score"], reverse=True)
     diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)
     diversified = diversified[:top_n]
 
-    # NEW: lazy-enrich image_url only for the picked results
     for item in diversified:
         prof = item["profile"]
         doc_id = item["doc_id"]
-        # If missing image_url, fetch + store + return
         ensure_image_url_for_firestore_doc(collection_name, doc_id, prof)
 
     return diversified
 
 # ========== Existing endpoints support (kept) ==========
 def auto_trip_generate(user_food, user_act, location="Beirut, Lebanon"):
-    # left unchanged; depends on rank_places(...) which isn't in your paste
-    # You can keep it or remove it if you don't use /auto-trip
     plan = []
     food_kw = " ".join(user_food.get("preferred_primary_features", [])[:2]) or "restaurant"
     raw_food = places_service.text_search(food_kw, location, place_type="restaurant")
-    ranked_food = []  # optional: you can remove auto-trip if unused
+    ranked_food = []
     plan.append({
         "requirement": {"type": "restaurant", "count": 1, "keywords": [food_kw], "location_hint": location},
         "recommendations": ranked_food
@@ -602,7 +586,6 @@ def firestore_trip_generate_from_query(
     extraction = extract_requirements_with_openai(query)
     requirements = extraction.get("requirements", []) or []
 
-    # If extraction fails, fall back to old default behavior
     if not requirements:
         return {"extracted": extraction, "plan": firestore_trip_generate(
             user_food, user_act,
@@ -624,7 +607,6 @@ def firestore_trip_generate_from_query(
         force_location = bool(location_hint and str(location_hint).strip())
 
         if typ == "restaurant":
-            # 1) Firestore first
             recs = rank_places_from_firestore(
                 collection_name="RestaurantsFinal",
                 user_profile=user_food,
@@ -639,34 +621,28 @@ def firestore_trip_generate_from_query(
 
             missing = count - len(recs)
 
-            # 2) Google fallback if missing
             if missing > 0:
-                # If force_location, search in that location; else use a very general Lebanon bias.
-                # We don't have request.location anymore; we keep the search broad.
                 search_loc = location_hint if force_location else "Lebanon"
                 raw = places_service.text_search(kw, search_loc, place_type="restaurant", max_pages=1)
 
                 google_candidates = []
                 for p in raw:
-                    # profile from Places reviews
                     place_profile = extract_place_profile(p, "food")
                     s = match_user_to_place(user_food, place_profile, "food")
 
-                    # small distance bias unless forced location
                     if not force_location:
                         s += distance_bias_bonus(
                             user_latitude, user_longitude,
                             p.get("latitude"), p.get("longitude"),
                         )
 
-                    # upsert + get image url
                     _, image_url = upsert_place_into_firestore("RestaurantsFinal", p, "food")
 
-                    # include fields in response profile
                     place_profile["image_url"] = image_url
                     place_profile["latitude"] = p.get("latitude")
                     place_profile["longitude"] = p.get("longitude")
-                    place_profile["place_id"] = p.get("place_id")
+                    # FIX: use google_place_id
+                    place_profile["google_place_id"] = p.get("place_id")
 
                     google_candidates.append({
                         "name": place_profile["name"],
@@ -675,7 +651,6 @@ def firestore_trip_generate_from_query(
                         "doc_id": p.get("place_id") or "",
                     })
 
-                # sort + diversify then take missing
                 google_candidates.sort(key=lambda x: x["score"], reverse=True)
                 google_picks = diversify_by_distance(google_candidates, k=missing, min_spread_km=2.0)
                 recs.extend(google_picks)
@@ -692,7 +667,6 @@ def firestore_trip_generate_from_query(
             })
 
         else:
-            # Activities
             recs = rank_places_from_firestore(
                 collection_name="ActivitiesFinal",
                 user_profile=user_act,
@@ -727,7 +701,8 @@ def firestore_trip_generate_from_query(
                     place_profile["image_url"] = image_url
                     place_profile["latitude"] = p.get("latitude")
                     place_profile["longitude"] = p.get("longitude")
-                    place_profile["place_id"] = p.get("place_id")
+                    # FIX: use google_place_id
+                    place_profile["google_place_id"] = p.get("place_id")
 
                     google_candidates.append({
                         "name": place_profile["name"],
