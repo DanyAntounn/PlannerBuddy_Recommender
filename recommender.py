@@ -180,79 +180,121 @@ class GooglePlacesService:
 places_service = GooglePlacesService()
 
 # =========================
-# FIX: use google_place_id (Firestore) + name-only fallback
+# FIX: use google_place_id + name+location fallback (strict similarity)
 # =========================
-def find_google_place_id_by_name(name: str, fallback_location: str = "Lebanon") -> str | None:
+def find_google_place_id_by_name_location(name: str, location_hint: str | None, fallback_location: str = "Lebanon") -> str | None:
     """
-    If a Firestore doc doesn't have google_place_id, try to find it via Google Places Text Search (name only).
+    If a Firestore doc doesn't have google_place_id:
+    - search by name in (location_hint or fallback_location)
+    - pick best by name similarity
+    - require similarity >= 80
     """
     if not name:
         return None
-    q = str(name).strip()
-    if not q:
+    name = str(name).strip()
+    if not name:
         return None
 
+    loc = (location_hint or "").strip()
+    if not loc:
+        loc = fallback_location
+
     try:
-        results = places_service.text_search(q, fallback_location, place_type=None, max_pages=1)
-        if results:
-            return results[0].get("place_id")
+        results = places_service.text_search(name, loc, place_type=None, max_pages=1)
     except Exception:
-        pass
-    return None
+        results = []
+
+    if not results:
+        return None
+
+    best = None
+    best_score = -1
+    for r in results[:5]:
+        rname = (r.get("name") or "").strip()
+        if not rname:
+            continue
+        score = fuzz.token_set_ratio(name.lower(), rname.lower())
+        if score > best_score:
+            best_score = score
+            best = r
+
+    if not best or best_score < 80:
+        return None
+
+    return best.get("place_id")
 
 
 def ensure_image_url_for_firestore_doc(
     collection_name: str,
     doc_id: str,
     place_profile: dict,
+    location_hint: str | None = None,
 ) -> str | None:
+    """
+    Rule:
+    1) If doc has google_place_id -> fetch image directly via details(place_id)
+    2) If missing google_place_id -> try to find similar by name+location (strict) and use that
+    3) If cannot find -> return None
+    """
     # Already has one
     if place_profile.get("image_url"):
         return place_profile["image_url"]
 
-    # FIX: read google_place_id (not place_id)
+    # 1) Use google_place_id directly (NO fallback search if it exists)
     google_place_id = place_profile.get("google_place_id")
+    if google_place_id:
+        details = places_service._details(google_place_id)
+        if not details:
+            return None
 
-    # If no google_place_id, fallback: name only (as requested)
-    if not google_place_id:
-        google_place_id = find_google_place_id_by_name(
-            place_profile.get("name", ""),
-            fallback_location="Lebanon",
-        )
-        if google_place_id:
-            place_profile["google_place_id"] = google_place_id
+        image_url = build_places_photo_url(details.get("photo_reference"))
+        update_data = {}
 
-    if not google_place_id:
+        if image_url:
+            update_data["image_url"] = image_url
+            place_profile["image_url"] = image_url
+
+        # Patch missing lat/lon on the profile + Firestore if profile has none
+        lat = details.get("latitude")
+        lon = details.get("longitude")
+        if lat is not None and lon is not None:
+            if place_profile.get("latitude") is None or place_profile.get("longitude") is None:
+                place_profile["latitude"] = lat
+                place_profile["longitude"] = lon
+                update_data["location"] = GeoPoint(float(lat), float(lon))
+
+        if update_data:
+            db.collection(collection_name).document(doc_id).set(update_data, merge=True)
+
+        return place_profile.get("image_url")
+
+    # 2) Missing google_place_id -> strict name+location fallback
+    name = place_profile.get("name", "")
+    found_id = find_google_place_id_by_name_location(name, location_hint, fallback_location="Lebanon")
+    if not found_id:
         return None
 
-    details = places_service._details(google_place_id)
+    details = places_service._details(found_id)
     if not details:
         return None
 
     image_url = build_places_photo_url(details.get("photo_reference"))
+    update_data = {"google_place_id": found_id}
 
-    update_data = {}
-
-    # Save google_place_id if we found it (or it exists)
-    if place_profile.get("google_place_id"):
-        update_data["google_place_id"] = place_profile["google_place_id"]
-
-    # Save image_url if found
     if image_url:
         update_data["image_url"] = image_url
         place_profile["image_url"] = image_url
 
-    # Patch missing lat/lon on the profile + Firestore if profile has none
     lat = details.get("latitude")
     lon = details.get("longitude")
     if lat is not None and lon is not None:
         if place_profile.get("latitude") is None or place_profile.get("longitude") is None:
             place_profile["latitude"] = lat
             place_profile["longitude"] = lon
-            update_data["location"] = GeoPoint(float(lat), float(lon))
+        update_data["location"] = GeoPoint(float(lat), float(lon))
 
-    if update_data:
-        db.collection(collection_name).document(doc_id).set(update_data, merge=True)
+    db.collection(collection_name).document(doc_id).set(update_data, merge=True)
+    place_profile["google_place_id"] = found_id
 
     return place_profile.get("image_url")
 
@@ -447,14 +489,14 @@ def build_profile_from_firestore_doc(doc_data: dict, recommendation_type: str):
         "latitude": latitude,
         "longitude": longitude,
         "image_url": doc_data.get("image_url"),
-        # FIX: read google_place_id from Firestore
-        "google_place_id": doc_data.get("google_place_id"),
+        "google_place_id": doc_data.get("google_place_id"),  # FIX
         "raw": doc_data,
     }
 
 def upsert_place_into_firestore(collection_name: str, place_details: dict, recommendation_type: str):
     """
     Upsert place + image_url + location geopoint + enrichment fields so it becomes rankable from Firestore next time.
+    (Keeping your existing doc_id behavior; only schema change is google_place_id field.)
     """
     place_id = place_details.get("place_id")
     name = place_details.get("name", "Unknown")
@@ -471,8 +513,7 @@ def upsert_place_into_firestore(collection_name: str, place_details: dict, recom
         "num_reviews": int(place_details.get("user_ratings_total") or 0),
         "reviews": place_details.get("reviews") or [],
         "types": place_details.get("types") or [],
-        # FIX: store google_place_id (not place_id) for your schema
-        "google_place_id": place_id,
+        "google_place_id": place_id,  # FIX
     }
 
     lat = place_details.get("latitude")
@@ -548,10 +589,11 @@ def rank_places_from_firestore(
     diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)
     diversified = diversified[:top_n]
 
+    # IMPORTANT: location_hint used ONLY for missing-id fallback
     for item in diversified:
         prof = item["profile"]
         doc_id = item["doc_id"]
-        ensure_image_url_for_firestore_doc(collection_name, doc_id, prof)
+        ensure_image_url_for_firestore_doc(collection_name, doc_id, prof, location_hint=location_hint)
 
     return diversified
 
@@ -641,8 +683,7 @@ def firestore_trip_generate_from_query(
                     place_profile["image_url"] = image_url
                     place_profile["latitude"] = p.get("latitude")
                     place_profile["longitude"] = p.get("longitude")
-                    # FIX: use google_place_id
-                    place_profile["google_place_id"] = p.get("place_id")
+                    place_profile["google_place_id"] = p.get("place_id")  # FIX
 
                     google_candidates.append({
                         "name": place_profile["name"],
@@ -701,8 +742,7 @@ def firestore_trip_generate_from_query(
                     place_profile["image_url"] = image_url
                     place_profile["latitude"] = p.get("latitude")
                     place_profile["longitude"] = p.get("longitude")
-                    # FIX: use google_place_id
-                    place_profile["google_place_id"] = p.get("place_id")
+                    place_profile["google_place_id"] = p.get("place_id")  # FIX
 
                     google_candidates.append({
                         "name": place_profile["name"],
@@ -750,6 +790,7 @@ def firestore_trip_generate(
         user_latitude=user_latitude,
         user_longitude=user_longitude,
         force_location=False,
+        location_hint=location,  # harmless; only used if google_place_id missing
     )
     plan.append({
         "requirement": {
@@ -771,6 +812,7 @@ def firestore_trip_generate(
         user_latitude=user_latitude,
         user_longitude=user_longitude,
         force_location=False,
+        location_hint=location,  # harmless; only used if google_place_id missing
     )
     plan.append({
         "requirement": {
@@ -784,7 +826,7 @@ def firestore_trip_generate(
 
     return {"plan": plan}
 
-# ========== Firestore enrichment (unchanged, from your version) ==========
+# ========== Firestore enrichment (unchanged) ==========
 def build_place_dict_from_firestore_doc(doc_data: dict) -> dict:
     reviews = doc_data.get("reviews") or []
     rating = doc_data.get("rating", 0.0) or 0.0
