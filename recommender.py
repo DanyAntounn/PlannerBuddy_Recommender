@@ -97,13 +97,13 @@ def build_places_photo_url(photo_reference: str, maxwidth: int = 1200) -> str | 
         return None
     return f"{BASE_URL}/photo?maxwidth={maxwidth}&photo_reference={photo_reference}&key={GOOGLE_API_KEY}"
 
+
 class GooglePlacesService:
     def __init__(self, api_key=GOOGLE_API_KEY):
         self.api_key = api_key
         self.session = requests.Session()
 
     def _details(self, place_id):
-        # NEW: include place_id, photos, geometry for lat/lon
         url = (
             f"{BASE_URL}/details/json"
             f"?place_id={place_id}"
@@ -162,6 +162,71 @@ class GooglePlacesService:
             if not token:
                 break
         return all_results
+
+    def find_place_id_from_text(self, text: str, user_lat: float | None = None, user_lon: float | None = None) -> str | None:
+        if not text:
+            return None
+
+        url = (
+            f"{BASE_URL}/findplacefromtext/json"
+            f"?input={requests.utils.quote(text)}"
+            f"&inputtype=textquery"
+            f"&fields=place_id,name"
+            f"&key={self.api_key}"
+        )
+
+        if user_lat is not None and user_lon is not None:
+            url += f"&locationbias=point:{user_lat},{user_lon}"
+
+        try:
+            r = self.session.get(url, timeout=20)
+            data = r.json()
+            if data.get("status") != "OK":
+                return None
+
+            candidates = data.get("candidates") or []
+            if not candidates:
+                return None
+
+            return candidates[0].get("place_id")
+        except:
+            return None
+
+    def get_photo_and_geometry(self, place_id: str) -> dict | None:
+        if not place_id:
+            return None
+
+        url = (
+            f"{BASE_URL}/details/json"
+            f"?place_id={place_id}"
+            f"&fields=place_id,photos,geometry"
+            f"&key={self.api_key}"
+        )
+
+        try:
+            r = self.session.get(url, timeout=20)
+            data = r.json()
+            if data.get("status") != "OK":
+                return None
+
+            res = data.get("result") or {}
+            photos = res.get("photos", []) or []
+            photo_ref = photos[0].get("photo_reference") if photos else None
+
+            geom = res.get("geometry", {}).get("location", {}) or {}
+            lat = geom.get("lat")
+            lng = geom.get("lng")
+
+            return {
+                "place_id": res.get("place_id", place_id),
+                "photo_reference": photo_ref,
+                "latitude": lat,
+                "longitude": lng,
+            }
+        except:
+            return None
+
+
 
 places_service = GooglePlacesService()
 
@@ -469,7 +534,94 @@ def rank_places_from_firestore(
     # Sort then diversify
     scored.sort(key=lambda x: x["score"], reverse=True)
     diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)
-    return diversified[:top_n]
+    picks = diversified[:top_n]
+
+    # NEW: if Firestore picks are missing image_url, fetch from Places and save back
+    fill_missing_images_for_firestore_picks(
+        picks=picks,
+        collection_name=collection_name,
+        user_latitude=user_latitude,
+        user_longitude=user_longitude,
+    )
+
+    return picks
+
+
+
+
+def fill_missing_images_for_firestore_picks(
+    picks: list[dict],
+    collection_name: str,
+    user_latitude: float | None = None,
+    user_longitude: float | None = None,
+):
+    """
+    For selected recommendations coming from Firestore:
+    if profile.image_url is missing, fetch it from Google Places and save back to Firestore.
+    Updates picks in-place so the response includes image_url immediately.
+    """
+    for rec in picks:
+        try:
+            profile = rec.get("profile") or {}
+            if profile.get("image_url"):
+                continue  # already has image
+
+            name = profile.get("name") or rec.get("name")
+            if not name:
+                continue
+
+            # 1) If we already stored place_id in Firestore, use it
+            place_id = profile.get("place_id")
+            if not place_id:
+                # 2) Otherwise try to find a place_id from text
+                #    include address if we have it, improves matching
+                address = profile.get("address")
+                query_text = f"{name} {address}" if address else name
+
+                place_id = places_service.find_place_id_from_text(
+                    query_text,
+                    user_lat=user_latitude,
+                    user_lon=user_longitude,
+                )
+
+            if not place_id:
+                continue
+
+            info = places_service.get_photo_and_geometry(place_id)
+            if not info:
+                continue
+
+            img_url = build_places_photo_url(info.get("photo_reference"))
+            if not img_url:
+                continue
+
+            # Update local response
+            profile["image_url"] = img_url
+            profile["place_id"] = info.get("place_id", place_id)
+
+            # If Firestore doc lacks coordinates but Places has them, store them too
+            lat = info.get("latitude")
+            lon = info.get("longitude")
+            if profile.get("latitude") is None and lat is not None:
+                profile["latitude"] = lat
+            if profile.get("longitude") is None and lon is not None:
+                profile["longitude"] = lon
+
+            # Save back into Firestore
+            update_data = {
+                "image_url": img_url,
+                "place_id": info.get("place_id", place_id),
+            }
+            if lat is not None and lon is not None:
+                update_data["location"] = GeoPoint(float(lat), float(lon))
+
+            doc_id = rec.get("doc_id")
+            if doc_id:
+                db.collection(collection_name).document(doc_id).set(update_data, merge=True)
+
+        except:
+            # Never fail the whole request because 1 image fetch died
+            continue
 
 # ========== Existing endpoints support (kept) ==========
 def auto_trip_generate(user_food, user_act, location="Beirut, Lebanon"):
