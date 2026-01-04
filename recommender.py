@@ -13,6 +13,14 @@ from google.cloud import firestore
 from google.oauth2 import service_account
 from google.cloud.firestore_v1 import GeoPoint
 
+from nltk.corpus import wordnet as wn
+
+try:
+    wn.ensure_loaded()
+except Exception:
+    _ = wn.synsets("dog")
+
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
@@ -36,7 +44,14 @@ def preprocess_text(text: str):
     if not isinstance(text, str):
         return []
     tokens = word_tokenize(text.lower())
-    return [lemmatizer.lemmatize(t) for t in tokens if t.isalpha() and t not in stop_words]
+    out = []
+    for t in tokens:
+        if t.isalpha() and t not in stop_words:
+            try:
+                out.append(lemmatizer.lemmatize(t))
+            except Exception:
+                out.append(t)
+    return out
 
 # --- Keywords (unchanged) ---
 FOOD_CUISINE_KEYWORDS = ["lebanese","mediterranean","bbq","grilled","shawarma","mezza","italian",
@@ -164,6 +179,79 @@ class GooglePlacesService:
         return all_results
 
 places_service = GooglePlacesService()
+
+def find_place_id_by_name_address(name: str, address: str, fallback_location: str = "Lebanon") -> str | None:
+    """
+    If a Firestore doc doesn't have place_id, try to find it via Google Places Text Search.
+    Keeps it lightweight: 1 page.
+    """
+    if not name:
+        return None
+    q = name
+    if address:
+        q = f"{name} {address}"
+    try:
+        results = places_service.text_search(q, fallback_location, place_type=None, max_pages=1)
+        if results:
+            return results[0].get("place_id")
+    except Exception:
+        pass
+    return None
+
+
+def ensure_image_url_for_firestore_doc(
+    collection_name: str,
+    doc_id: str,
+    place_profile: dict,
+) -> str | None:
+    # Already has one
+    if place_profile.get("image_url"):
+        return place_profile["image_url"]
+
+    place_id = place_profile.get("place_id")
+
+    # If no place_id, try to recover it (expensive + possibly wrong)
+    if not place_id:
+        name = place_profile.get("name", "")
+        address = place_profile.get("address", "")
+        if name and address:  # only do it when we have both
+            place_id = find_place_id_by_name_address(name, address, fallback_location="Lebanon")
+            if place_id:
+                place_profile["place_id"] = place_id
+
+    if not place_id:
+        return None
+
+    details = places_service._details(place_id)
+    if not details:
+        return None
+
+    image_url = build_places_photo_url(details.get("photo_reference"))
+
+    update_data = {}
+
+    # Save place_id if missing
+    if not place_profile.get("place_id") and place_id:
+        update_data["place_id"] = place_id
+
+    # Save image_url if found
+    if image_url:
+        update_data["image_url"] = image_url
+        place_profile["image_url"] = image_url
+
+    # Patch missing lat/lon on the profile + Firestore if profile has none
+    lat = details.get("latitude")
+    lon = details.get("longitude")
+    if lat is not None and lon is not None:
+        if place_profile.get("latitude") is None or place_profile.get("longitude") is None:
+            place_profile["latitude"] = lat
+            place_profile["longitude"] = lon
+            update_data["location"] = GeoPoint(float(lat), float(lon))
+
+    if update_data:
+        db.collection(collection_name).document(doc_id).set(update_data, merge=True)
+
+    return place_profile.get("image_url")
 
 # ========== NLP scoring ==========
 def fuzzy_in(text, needle, thresh=85):
@@ -422,6 +510,7 @@ def rank_places_from_firestore(
     - SMALL distance bias (unless force_location)
     - optional lightweight location_hint filter if force_location=True
     - diversity rerank
+    - NEW: if picked docs have no image_url, fetch via Google Places + update Firestore + return it
     """
     docs = db.collection(collection_name).stream()
     q_tokens = preprocess_text(query)
@@ -469,7 +558,16 @@ def rank_places_from_firestore(
     # Sort then diversify
     scored.sort(key=lambda x: x["score"], reverse=True)
     diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)
-    return diversified[:top_n]
+    diversified = diversified[:top_n]
+
+    # NEW: lazy-enrich image_url only for the picked results
+    for item in diversified:
+        prof = item["profile"]
+        doc_id = item["doc_id"]
+        # If missing image_url, fetch + store + return
+        ensure_image_url_for_firestore_doc(collection_name, doc_id, prof)
+
+    return diversified
 
 # ========== Existing endpoints support (kept) ==========
 def auto_trip_generate(user_food, user_act, location="Beirut, Lebanon"):
