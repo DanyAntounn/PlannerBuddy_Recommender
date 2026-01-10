@@ -14,9 +14,12 @@ class UserProfile(BaseModel):
     min_reviews_count: int
 
 class TripRequest(BaseModel):
-    query: str
+    query: Optional[str] = None
     user_food: UserProfile
     user_act: UserProfile
+    num_restaurants: int = 1
+    num_activities: int = 2
+    location: Optional[Union[str, LocationPayload]] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
