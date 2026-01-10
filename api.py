@@ -1,8 +1,9 @@
 # api.py
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, Response
 from trip_planner import firestore_trip_generate_from_query, build_flutter_payload
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Union
 
 app = FastAPI()
 
