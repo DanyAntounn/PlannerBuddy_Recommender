@@ -159,7 +159,7 @@ class GooglePlacesService:
     def text_search(self, query, location_str, place_type=None, max_pages=1):
         all_results, token, page = [], None, 0
         while page < max_pages:
-            url = f"{BASE_URL}/textsearch/json?query={requests.utils.quote(query + ' in ' + location_str)}&key={self.api_key}"
+            url = f"{BASE_URL}/textsearch/json?query={requests.utils.quote(query + ' in ' + location_str + ', Lebanon')}&key={self.api_key}"
             if place_type:
                 url += f"&type={place_type}"
             if token:
