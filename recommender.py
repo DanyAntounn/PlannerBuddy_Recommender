@@ -598,10 +598,16 @@ def firestore_trip_generate_from_query(
     user_latitude: float | None = None,
     user_longitude: float | None = None,
 ):
+    """
+    Query-driven trip generator.
+    - Uses OpenAI to extract requirements
+    - Searches **Google Places API only**, ignores Firestore.
+    """
     extraction = extract_requirements_with_openai(query)
     requirements = extraction.get("requirements", []) or []
 
     if not requirements:
+        # Fallback to Firestore if extraction fails
         return {"extracted": extraction, "plan": firestore_trip_generate(
             user_food, user_act,
             num_restaurants=1, num_activities=2,
@@ -610,51 +616,44 @@ def firestore_trip_generate_from_query(
             user_longitude=user_longitude,
         )["plan"]}
 
+    gps = GooglePlacesService()
     plan = []
 
-    for req in requirements:
-        typ = req.get("type")
-        count = int(req.get("count", 1))
-        keywords = req.get("keywords", []) or []
-        kw = " ".join(keywords).strip() or (typ or "")
+    for req_item in requirements:
+        typ = req_item.get("type")
+        count = int(req_item.get("count", 1))
+        keywords = req_item.get("keywords", []) or []
+        location_hint = req_item.get("location_hint") or "Lebanon"
 
-        location_hint = req.get("location_hint")
-        force_location = bool(location_hint and str(location_hint).strip())
+        query_str = " ".join(keywords).strip() or typ
 
-        if typ == "restaurant":
-            recs = rank_places_from_firestore(
-                collection_name="RestaurantsFinal",
-                user_profile=user_food,
-                recommendation_type="food",
-                top_n=count,
-                query=kw,
-                user_latitude=user_latitude,
-                user_longitude=user_longitude,
-                force_location=force_location,
-                location_hint=location_hint,
+        # --- GOOGLE PLACES ONLY ---
+        results = gps.text_search(query_str, location_hint, max_pages=1)[:count]
+
+        recommendations = []
+        for r in results:
+            profile = extract_place_profile(r, "food" if typ == "restaurant" else "activity")
+            score = match_user_to_place(
+                user_food if typ=="restaurant" else user_act,
+                profile,
+                typ
             )
-
-            plan.append({
-                "requirement": {"type": "restaurant", "count": count, "keywords": keywords, "location_hint": location_hint, "time_hint": req.get("time_hint")},
-                "recommendations": recs[:count],
+            recommendations.append({
+                "name": r.get("name"),
+                "score": round(float(score), 2),
+                "profile": profile
             })
-        else:
-            recs = rank_places_from_firestore(
-                collection_name="ActivitiesFinal",
-                user_profile=user_act,
-                recommendation_type="activity",
-                top_n=count,
-                query=kw,
-                user_latitude=user_latitude,
-                user_longitude=user_longitude,
-                force_location=force_location,
-                location_hint=location_hint,
-            )
 
-            plan.append({
-                "requirement": {"type": "activity", "count": count, "keywords": keywords, "location_hint": location_hint, "time_hint": req.get("time_hint")},
-                "recommendations": recs[:count],
-            })
+        plan.append({
+            "requirement": {
+                "type": typ,
+                "count": count,
+                "keywords": keywords,
+                "location_hint": location_hint,
+                "time_hint": req_item.get("time_hint")
+            },
+            "recommendations": recommendations
+        })
 
     return {"extracted": extraction, "plan": plan}
 
