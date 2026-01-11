@@ -4,17 +4,24 @@ PlannerBuddy Chatbot Router
 - Rule:
   - Specific place/entity -> Google Places (via recommender.places_service)
   - Preference-based recommendation -> Firestore-first (via recommender.rank_places_from_firestore)
-- Adds:
+- Tools:
+  - google_specific_search
   - google_place_details
   - compare_places
+  - firestore_recommend
 - Includes:
   - Locked system prompt (user cannot change it)
   - "Cannot add places to trips from chatbot" limitation
   - Accuracy disclaimer
+- Fixes:
+  - Greetings/small talk should not trigger tools
+  - Reply must be plain text (no markdown)
+  - Suggestion requests must detect restaurant vs activity vs both (no more “activities” -> restaurants too)
 """
 
 import os
 import json
+import re
 from typing import Optional, Any, Literal
 
 from fastapi import APIRouter, HTTPException
@@ -23,13 +30,12 @@ from openai import OpenAI
 from fuzzywuzzy import fuzz
 
 from recommender import (
-    places_service,                 # GooglePlacesService instance (already Lebanon-hinted in your implementation)
+    places_service,                 # GooglePlacesService instance
     rank_places_from_firestore,      # Firestore-first ranking
     PUBLIC_BASE_URL,
 )
 
 router = APIRouter()
-
 _openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
@@ -60,8 +66,96 @@ class ChatResponse(BaseModel):
 
 
 # -----------------------
-# Small helpers (formatting only)
+# Small talk + formatting helpers
 # -----------------------
+_GREETING_RE = re.compile(
+    r"^(hi|hello|hey|yo|sup|good (morning|afternoon|evening)|hola|salut|bonjour)\b",
+    re.IGNORECASE,
+)
+_SMALL_TALK_EXACT = {
+    "thanks", "thank you", "ty", "ok", "okay", "cool", "nice", "great", "good",
+    "lol", "lmao", "haha", "yup", "yep", "nope"
+}
+
+# Suggestion intent detection
+_SUGGEST_RE = re.compile(r"\b(suggest|recommend|recommendation|ideas)\b", re.IGNORECASE)
+_FOOD_RE = re.compile(
+    r"\b(food|eat|restaurant|restaurants|cafe|caf[eé]|coffee|lunch|dinner|breakfast|brunch|dessert|"
+    r"burger|pizza|sushi|shawarma|mezza|bbq|steak)\b",
+    re.IGNORECASE
+)
+_ACT_RE = re.compile(
+    r"\b(activity|activities|things to do|places to visit|visit|go out|hike|hiking|beach|museum|park|trail|"
+    r"walk|explore|trip|outing|nature|waterfall|ruins|church|tour)\b",
+    re.IGNORECASE
+)
+
+
+def _is_small_talk(msg: str) -> bool:
+    m = (msg or "").strip().lower()
+    if not m:
+        return True
+    if _GREETING_RE.match(m):
+        return True
+    if m in _SMALL_TALK_EXACT:
+        return True
+    if len(m) <= 3:
+        return True
+    return False
+
+
+def _suggestion_mode(msg: str) -> str:
+    """
+    Returns: 'restaurant' | 'activity' | 'both' | 'unknown'
+    Only triggers if message looks like a suggestion request.
+    """
+    t = (msg or "").strip()
+    if not t:
+        return "unknown"
+
+    if not _SUGGEST_RE.search(t):
+        return "unknown"
+
+    wants_food = bool(_FOOD_RE.search(t))
+    wants_act = bool(_ACT_RE.search(t))
+
+    if wants_food and wants_act:
+        return "both"
+    if wants_food:
+        return "restaurant"
+    if wants_act:
+        return "activity"
+    return "unknown"
+
+
+def strip_markdown(text: str) -> str:
+    """
+    Removes markdown formatting so Flutter chat bubbles don't show raw ###, **, [x](y), etc.
+    Keeps the text meaning, removes formatting.
+    """
+    if not text:
+        return ""
+
+    # Headings
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+
+    # Bold/italic
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+
+    # Links: [label](url) -> label
+    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
+
+    # Bullets / numbered lists
+    text = re.sub(r"^\s*[-*]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+
+    # Extra whitespace cleanup
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    return text
+
+
 def _clamp_limit(n: int) -> int:
     try:
         n = int(n)
@@ -80,11 +174,22 @@ def _image_url(place_id: Optional[str]) -> Optional[str]:
     return None
 
 
+def _dedupe_places(places: list[dict]) -> list[dict]:
+    seen = set()
+    out = []
+    for p in places or []:
+        key = (p.get("place_id") or p.get("name") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+# -----------------------
+# Google + Firestore helpers
+# -----------------------
 def _google_search_lebanon(query: str, location_hint: Optional[str], limit: int) -> list[dict]:
-    """
-    Uses recommender.places_service.text_search and filters to Lebanon.
-    Returns "cards" suitable for Flutter.
-    """
     q = (query or "").strip()
     if not q:
         return []
@@ -118,9 +223,6 @@ def _google_search_lebanon(query: str, location_hint: Optional[str], limit: int)
 
 
 def _google_best_match(query: str, location_hint: Optional[str]) -> Optional[dict]:
-    """
-    Picks best match from Google search results by name similarity (Lebanon-only).
-    """
     q = (query or "").strip()
     if not q:
         return None
@@ -176,9 +278,6 @@ def _firestore_cards(
     user_longitude: Optional[float],
     location_hint: Optional[str],
 ) -> list[dict]:
-    """
-    Uses recommender.rank_places_from_firestore and returns cards for Flutter.
-    """
     typ = (recommendation_type or "activity").strip().lower()
     if typ not in ("restaurant", "activity"):
         typ = "activity"
@@ -255,9 +354,9 @@ def tool_compare_places(place_a: str, place_b: str, location_hint: Optional[str]
             summary_bits.append(f"Both have the same number of reviews ({na}).")
     else:
         if not a:
-            summary_bits.append(f"I couldn't confidently find **{place_a}** in Lebanon.")
+            summary_bits.append(f"I couldn't confidently find {place_a} in Lebanon.")
         if not b:
-            summary_bits.append(f"I couldn't confidently find **{place_b}** in Lebanon.")
+            summary_bits.append(f"I couldn't confidently find {place_b} in Lebanon.")
 
     return {
         "comparison": {
@@ -391,6 +490,8 @@ DATA ACCURACY DISCLAIMER:
 - Do not present rankings as absolute truth. Use phrasing like “Based on available data…”.
 
 Tool routing rules (must follow):
+- If the user message is a greeting/thanks/small talk and does not ask for places:
+  respond naturally and DO NOT call tools.
 - If the user mentions a specific place/brand/proper noun OR asks for rating/address/details of a named place:
   call google_specific_search or google_place_details (Google Places only, Lebanon).
 - If the user asks to compare two places:
@@ -398,10 +499,11 @@ Tool routing rules (must follow):
 - If the user asks for recommendations based on preferences/ambiance/features/personality:
   call firestore_recommend (Firestore-first).
 
-Response style:
-- Be concise.
-- If you called a tool, summarize the top results and include ratings when available.
-- If the user asks to add a place to their trip, explain you can’t do it from chat and point them to the planner screen.
+Formatting rules (STRICT):
+- Reply must be plain text only.
+- Do NOT use markdown (no ###, **, -, numbered lists, or [text](url)).
+- Keep replies short and conversational.
+- If places are returned, summarize briefly; place cards are shown via the UI, not as a list in text.
 """
 
 
@@ -413,7 +515,53 @@ def chat(req: ChatRequest):
 
     limit = _clamp_limit(req.limit)
 
-    # Context: model can choose tools using this info, but cannot change system prompt
+    # Fast path: greetings / small talk => no tools, no place spam
+    if _is_small_talk(msg):
+        return {"reply": "Hey! What are you in the mood for — food, activities, or both?", "places": []}
+
+    # Fast path: suggestion requests => deterministic restaurant vs activity vs both
+    mode = _suggestion_mode(msg)
+    if mode in ("restaurant", "activity", "both"):
+        places_out: list[dict] = []
+
+        if mode in ("restaurant", "both"):
+            places_out.extend(_firestore_cards(
+                recommendation_type="restaurant",
+                user_profile=req.user_food.dict(),
+                intent=msg,
+                limit=limit,
+                user_latitude=req.latitude,
+                user_longitude=req.longitude,
+                location_hint=req.location_hint,
+            ))
+
+        if mode in ("activity", "both"):
+            places_out.extend(_firestore_cards(
+                recommendation_type="activity",
+                user_profile=req.user_act.dict(),
+                intent=msg,
+                limit=limit,
+                user_latitude=req.latitude,
+                user_longitude=req.longitude,
+                location_hint=req.location_hint,
+            ))
+
+        places_out = _dedupe_places(places_out)
+
+        if mode == "restaurant":
+            reply = "Based on your preferences, here are some restaurant suggestions in Lebanon. You can add them from the Trip/Planner screen."
+        elif mode == "activity":
+            reply = "Based on your preferences, here are some activity suggestions in Lebanon. You can add them from the Trip/Planner screen."
+        else:
+            reply = "Based on your preferences, here are some suggestions in Lebanon. You can add them from the Trip/Planner screen."
+
+        return {"reply": reply, "places": places_out}
+
+    # Suggestion request but unclear type => ask one question, no tools
+    if _SUGGEST_RE.search(msg) and mode == "unknown":
+        return {"reply": "Sure — do you want restaurant suggestions, activity suggestions, or both?", "places": []}
+
+    # Otherwise: let OpenAI pick tools
     ctx = {
         "location_hint": req.location_hint or "Lebanon",
         "limit": limit,
@@ -430,7 +578,6 @@ def chat(req: ChatRequest):
 
     places_out: list[dict] = []
 
-    # Tool loop: up to 3 turns
     for _ in range(3):
         resp = _openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -443,15 +590,13 @@ def chat(req: ChatRequest):
         m = resp.choices[0].message
         tool_calls = getattr(m, "tool_calls", None)
 
-        # No tools => final assistant response
         if not tool_calls:
-            return {"reply": (m.content or "").strip(), "places": places_out}
+            return {"reply": strip_markdown((m.content or "").strip()), "places": places_out}
 
         for tc in tool_calls:
             fn = tc.function.name
             args = json.loads(tc.function.arguments or "{}")
 
-            # Execute tool
             if fn == "google_specific_search":
                 tool_res = tool_google_specific_search(
                     query=args.get("query", ""),
@@ -497,11 +642,9 @@ def chat(req: ChatRequest):
             else:
                 tool_res = {"places": []}
 
-            # Feed tool output back to the model
             messages.append({"role": "assistant", "tool_calls": [tc]})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(tool_res)})
 
-    # Best-effort fallback
     return {
         "reply": "Based on available data, here are the best matches I found in Lebanon.",
         "places": places_out,
