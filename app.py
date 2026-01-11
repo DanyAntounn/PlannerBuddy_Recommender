@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import Optional, Union
+from chatbot import router as chatbot_router
 
 import os
 import requests
@@ -15,6 +16,7 @@ from recommender import (
 )
 
 app = FastAPI(title="Trip Planner API")
+app.include_router(chatbot_router)
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 BASE_URL = "https://maps.googleapis.com/maps/api/place"
