@@ -13,6 +13,7 @@ from recommender import (
     enrich_collection_with_profiles_from_firestore,
     firestore_trip_generate,                # fallback (no query)
     firestore_trip_generate_from_query,     # query-driven
+    rank_places_from_firestore,
 )
 
 app = FastAPI(title="Trip Planner API")
@@ -50,6 +51,24 @@ class FirestoreTripRequest(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
+class MapFilterRequest(BaseModel):
+    user_food: UserProfile
+    user_act: UserProfile
+
+    # optional: user location for distance bias
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+    # optional: helps some “force_location” filters if you ever enable them
+    location_hint: Optional[str] = "Lebanon"
+
+    # how many to return
+    num_restaurants: int = 10
+    num_activities: int = 10
+
+    # optional: if your UI has a free-text “intent” field (ex: “sushi”, “hiking”)
+    restaurant_intent: Optional[str] = ""
+    activity_intent: Optional[str] = ""
 
 def _get_photo_reference(place_id: str) -> str | None:
     if not GOOGLE_API_KEY:
@@ -158,3 +177,63 @@ def firestore_trip(req: FirestoreTripRequest):
     )
     flutter_payload = build_flutter_payload(res["plan"])
     return {"plan": flutter_payload}
+
+@app.post("/map-filter")
+def map_filter(req: MapFilterRequest):
+    num_restaurants = max(1, min(int(req.num_restaurants or 10), 20))
+    num_activities = max(1, min(int(req.num_activities or 10), 20))
+
+    user_lat = req.latitude
+    user_lon = req.longitude
+    location_hint = (req.location_hint or "Lebanon").strip() or "Lebanon"
+
+    restaurants = rank_places_from_firestore(
+        collection_name="RestaurantsFinal",
+        user_profile=req.user_food.dict(),
+        recommendation_type="food",
+        top_n=num_restaurants,
+        query=(req.restaurant_intent or ""),
+        user_latitude=user_lat,
+        user_longitude=user_lon,
+        force_location=False,
+        location_hint=location_hint,
+    )
+
+    activities = rank_places_from_firestore(
+        collection_name="ActivitiesFinal",
+        user_profile=req.user_act.dict(),
+        recommendation_type="activity",
+        top_n=num_activities,
+        query=(req.activity_intent or ""),
+        user_latitude=user_lat,
+        user_longitude=user_lon,
+        force_location=False,
+        location_hint=location_hint,
+    )
+
+    def to_card(item: dict, typ: str) -> dict:
+        p = item.get("profile") or {}
+        gpid = p.get("google_place_id")
+
+        card = {
+            "type": typ,  # "restaurant" or "activity"
+            "name": item.get("name"),
+            "score": float(item.get("score") or 0.0),
+            "rating": float(p.get("rating") or 0.0),
+            "num_reviews": int(p.get("num_reviews") or 0),
+            "address": p.get("address"),
+            "place_id": gpid,
+            "latitude": p.get("latitude"),
+            "longitude": p.get("longitude"),
+        }
+
+        if gpid and os.getenv("PUBLIC_BASE_URL", "").strip():
+            base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+            card["image_url"] = f"{base}/photo?place_id={gpid}"
+
+        return card
+
+    return {
+        "restaurants": [to_card(x, "restaurant") for x in restaurants],
+        "activities": [to_card(x, "activity") for x in activities],
+    }
