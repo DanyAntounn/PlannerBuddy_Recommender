@@ -16,12 +16,16 @@ PlannerBuddy Chatbot Router
 - Fixes:
   - Greetings/small talk should not trigger tools
   - Reply must be plain text (no markdown)
-  - Suggestion requests must detect restaurant vs activity vs both (no more “activities” -> restaurants too)
+  - Suggestion requests must detect restaurant vs activity vs both
+- Randomization:
+  - If user asks for random/different/surprise -> enable zone_mode flags (pin + radius) in Firestore ranking
+  - Uses different seeds for restaurant vs activity so results actually change
 """
 
 import os
 import json
 import re
+import time
 import random
 from typing import Optional, Any, Literal
 
@@ -32,7 +36,7 @@ from fuzzywuzzy import fuzz
 
 from recommender import (
     places_service,                 # GooglePlacesService instance
-    rank_places_from_firestore,      # Firestore-first ranking
+    rank_places_from_firestore,      # Firestore-first ranking (supports zone_mode)
     PUBLIC_BASE_URL,
 )
 
@@ -118,6 +122,12 @@ _NIGHTLIFE_RE = re.compile(
     re.IGNORECASE
 )
 
+# Randomization intent: user wants different results
+_RANDOM_RE = re.compile(
+    r"\b(random|different|new|surprise|switch it up|another|anything else|change it up|mix it up)\b",
+    re.IGNORECASE
+)
+
 _LOCATION_HINT_RE = re.compile(
     r"\b(in|near|around|at)\s+([a-zA-ZÀ-ÿ' -]{2,40})(?:\b|$)",
     re.IGNORECASE
@@ -184,7 +194,6 @@ def _suggestion_mode(msg: str) -> str:
 def strip_markdown(text: str) -> str:
     if not text:
         return ""
-
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"\*(.*?)\*", r"\1", text)
@@ -226,7 +235,6 @@ def _dedupe_places(places: list[dict]) -> list[dict]:
 
 
 def _pick_reply(choices: list[str]) -> str:
-    # varied responses without looking robotic
     return random.choice(choices) if choices else ""
 
 
@@ -321,6 +329,11 @@ def _firestore_cards(
     user_latitude: Optional[float],
     user_longitude: Optional[float],
     location_hint: Optional[str],
+
+    # NEW: zone flags for randomization
+    zone_mode: bool = False,
+    zone_radius_km: float = 8.0,
+    zone_seed: Optional[int] = None,
 ) -> list[dict]:
     typ = (recommendation_type or "activity").strip().lower()
     if typ not in ("restaurant", "activity"):
@@ -339,6 +352,11 @@ def _firestore_cards(
         user_longitude=user_longitude,
         force_location=False,
         location_hint=location_hint,
+
+        # pass-through flags
+        zone_mode=zone_mode,
+        zone_radius_km=zone_radius_km,
+        zone_seed=zone_seed,
     )
 
     cards: list[dict] = []
@@ -431,6 +449,9 @@ def tool_firestore_recommend(
             user_latitude=user_latitude,
             user_longitude=user_longitude,
             location_hint=location_hint,
+            zone_mode=False,
+            zone_radius_km=8.0,
+            zone_seed=None,
         )
     }
 
@@ -551,7 +572,27 @@ Formatting rules (STRICT):
 """
 
 
-def _reply_for_mode(mode: str) -> str:
+def _reply_for_mode(mode: str, wants_random: bool) -> str:
+    if wants_random:
+        if mode == "restaurant":
+            return _pick_reply([
+                "Here are some different restaurant picks in Lebanon based on your preferences. You can add them from the Trip/Planner screen.",
+                "Want variety? Here are some restaurant options in Lebanon that should fit. Add any of them from the Trip/Planner screen.",
+                "I switched it up and found different restaurant picks in Lebanon. You can add them from the Trip/Planner screen.",
+            ])
+        if mode == "activity":
+            return _pick_reply([
+                "Here are some different activity picks in Lebanon based on your preferences. You can add them from the Trip/Planner screen.",
+                "Want something new? Here are some activities in Lebanon that match your vibe. Add any of them from the Trip/Planner screen.",
+                "I mixed it up and pulled different activity picks in Lebanon. You can add them from the Trip/Planner screen.",
+            ])
+        return _pick_reply([
+            "Here are some different picks in Lebanon based on your preferences. You can add them from the Trip/Planner screen.",
+            "I switched it up — here are some new suggestions in Lebanon. You can add them from the Trip/Planner screen.",
+            "Here are some fresh picks in Lebanon based on your preferences. You can add them from the Trip/Planner screen.",
+        ])
+
+    # normal (non-random)
     if mode == "restaurant":
         return _pick_reply([
             "Here are some restaurant picks in Lebanon based on your preferences. You can add them from the Trip/Planner screen.",
@@ -581,25 +622,35 @@ def chat(req: ChatRequest):
 
     # Fast path: greetings / small talk => no tools, no place spam
     if _is_small_talk(msg):
-        return {"reply": _pick_reply([
-            "Hey! What are you in the mood for — food, activities, or both?",
-            "Hey! Want restaurants, activities, or both?",
-            "Hi! Tell me what you feel like doing — eating, going out, or both?",
-        ]), "places": []}
+        return {
+            "reply": _pick_reply([
+                "Hey! What are you in the mood for — food, activities, or both?",
+                "Hey! Want restaurants, activities, or both?",
+                "Hi! Tell me what you feel like doing — eating, going out, or both?",
+            ]),
+            "places": []
+        }
 
     # Determine location hint from message if user provided one
     msg_loc_hint = _extract_location_hint(msg)
     effective_loc = msg_loc_hint or req.location_hint or "Lebanon"
+
+    # Randomization intent
+    wants_random = bool(_RANDOM_RE.search(msg))
+    seed_base = int(time.time())
 
     # Fast path: suggestion / category requests => deterministic routing
     mode = _suggestion_mode(msg)
     if mode in ("restaurant", "activity", "both"):
         places_out: list[dict] = []
 
-        # Nightlife should prefer Google results (Firestore likely weak here)
+        # Nightlife: prefer Google results (Firestore tends to be weak here)
         if mode in ("activity", "both") and _NIGHTLIFE_RE.search(msg):
             places_out.extend(_google_search_lebanon(query=msg, location_hint=effective_loc, limit=limit))
             places_out = _dedupe_places(places_out)
+
+            # If user asked "random nightlife", we still keep Google because it is fresher,
+            # but we vary the reply.
             return {
                 "reply": _pick_reply([
                     "Based on available data, here are some nightlife options in Lebanon. You can add them from the Trip/Planner screen.",
@@ -609,6 +660,7 @@ def chat(req: ChatRequest):
                 "places": places_out
             }
 
+        # Firestore recommendations (with optional zone randomization)
         if mode in ("restaurant", "both"):
             places_out.extend(_firestore_cards(
                 recommendation_type="restaurant",
@@ -618,6 +670,9 @@ def chat(req: ChatRequest):
                 user_latitude=req.latitude,
                 user_longitude=req.longitude,
                 location_hint=effective_loc,
+                zone_mode=wants_random,
+                zone_radius_km=6.0,
+                zone_seed=(seed_base + 1) if wants_random else None,
             ))
 
         if mode in ("activity", "both"):
@@ -629,19 +684,25 @@ def chat(req: ChatRequest):
                 user_latitude=req.latitude,
                 user_longitude=req.longitude,
                 location_hint=effective_loc,
+                zone_mode=wants_random,
+                zone_radius_km=10.0,
+                zone_seed=(seed_base + 2) if wants_random else None,
             ))
 
         places_out = _dedupe_places(places_out)
 
-        return {"reply": _reply_for_mode(mode), "places": places_out}
+        return {"reply": _reply_for_mode(mode, wants_random=wants_random), "places": places_out}
 
     # If it's asking for places but unclear type => ask one question, no tools
     if (_SUGGEST_RE.search(msg) or _ASK_PLACES_RE.search(msg)) and mode == "unknown":
-        return {"reply": _pick_reply([
-            "Sure — do you want restaurant suggestions, activity suggestions, or both?",
-            "Got it. Are you looking for restaurants, activities, or both?",
-            "Tell me what you want: restaurants, activities, or both?",
-        ]), "places": []}
+        return {
+            "reply": _pick_reply([
+                "Sure — do you want restaurant suggestions, activity suggestions, or both?",
+                "Got it. Are you looking for restaurants, activities, or both?",
+                "Tell me what you want: restaurants, activities, or both?",
+            ]),
+            "places": []
+        }
 
     # Otherwise: let OpenAI pick tools
     ctx = {
@@ -710,6 +771,7 @@ def chat(req: ChatRequest):
                 rec_type = args.get("recommendation_type", "activity")
                 profile = req.user_food.dict() if rec_type == "restaurant" else req.user_act.dict()
 
+                # NOTE: Tool path stays deterministic by default to avoid confusing behavior.
                 tool_res = tool_firestore_recommend(
                     recommendation_type=rec_type,
                     intent=args.get("intent", ""),
