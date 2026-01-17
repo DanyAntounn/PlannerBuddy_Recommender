@@ -22,6 +22,7 @@ PlannerBuddy Chatbot Router
 import os
 import json
 import re
+import random
 from typing import Optional, Any, Literal
 
 from fastapi import APIRouter, HTTPException
@@ -77,18 +78,64 @@ _SMALL_TALK_EXACT = {
     "lol", "lmao", "haha", "yup", "yep", "nope"
 }
 
-# Suggestion intent detection
-_SUGGEST_RE = re.compile(r"\b(suggest|recommend|recommendation|ideas)\b", re.IGNORECASE)
+# -----------------------
+# Intent detection (improved)
+# -----------------------
+_SUGGEST_RE = re.compile(
+    r"\b(suggest|recommend|recommendation|recommendations|ideas|options|where should i|what should i|"
+    r"any (good|nice|cool)|looking for|searching for|find me|show me|give me)\b",
+    re.IGNORECASE
+)
+
+_ASK_PLACES_RE = re.compile(
+    r"\b(places|spots|venues|locations|restaurants|restaurant|cafes|cafe|coffee|bars|bar|clubs|club|"
+    r"nightlife|things to do|activities|activity|to do|to visit|visit)\b",
+    re.IGNORECASE
+)
+
+_DETAILS_RE = re.compile(
+    r"\b(rating|reviews?|address|location|where is|phone|number|hours|open|close|menu|website|"
+    r"how much|price|entry|ticket)\b",
+    re.IGNORECASE
+)
+
 _FOOD_RE = re.compile(
-    r"\b(food|eat|restaurant|restaurants|cafe|caf[eé]|coffee|lunch|dinner|breakfast|brunch|dessert|"
-    r"burger|pizza|sushi|shawarma|mezza|bbq|steak)\b",
+    r"\b(food|eat|eating|restaurant|restaurants|resto|cafe|caf[eé]|coffee|lunch|dinner|breakfast|brunch|dessert|"
+    r"burger|pizza|sushi|shawarma|mezza|bbq|steak|seafood|lebanese|italian|asian|mexican|bakery)\b",
     re.IGNORECASE
 )
+
 _ACT_RE = re.compile(
-    r"\b(activity|activities|things to do|places to visit|visit|go out|hike|hiking|beach|museum|park|trail|"
-    r"walk|explore|trip|outing|nature|waterfall|ruins|church|tour)\b",
+    r"\b(activity|activities|things to do|things todo|to do|places to visit|to visit|visit|go out|outing|"
+    r"hike|hiking|trail|trek|walk|explore|adventure|nature|mountain|waterfall|beach|museum|park|"
+    r"ruins|church|tour|sightseeing|camping|picnic|spa|wellness|escape room|bowling|cinema|"
+    r"nightlife|night club|nightclub|night clubs|club|clubs|bar|bars|pub|party|dj|dance)\b",
     re.IGNORECASE
 )
+
+_NIGHTLIFE_RE = re.compile(
+    r"\b(nightlife|night club|nightclub|night clubs|club|clubs|party|dj|dance)\b",
+    re.IGNORECASE
+)
+
+_LOCATION_HINT_RE = re.compile(
+    r"\b(in|near|around|at)\s+([a-zA-ZÀ-ÿ' -]{2,40})(?:\b|$)",
+    re.IGNORECASE
+)
+
+
+def _extract_location_hint(msg: str) -> Optional[str]:
+    t = (msg or "").strip()
+    m = _LOCATION_HINT_RE.search(t)
+    if not m:
+        return None
+    loc = (m.group(2) or "").strip()
+    if len(loc) < 2:
+        return None
+    loc_low = loc.lower()
+    if loc_low in {"lebanon", "lb"}:
+        return "Lebanon"
+    return loc
 
 
 def _is_small_talk(msg: str) -> bool:
@@ -107,17 +154,23 @@ def _is_small_talk(msg: str) -> bool:
 def _suggestion_mode(msg: str) -> str:
     """
     Returns: 'restaurant' | 'activity' | 'both' | 'unknown'
-    Only triggers if message looks like a suggestion request.
+    Works for:
+      - explicit suggest: "recommend restaurants"
+      - category-only replies: "night clubs", "restaurants", "hiking"
+      - questions: "where should i go in jbeil"
     """
     t = (msg or "").strip()
     if not t:
         return "unknown"
 
-    if not _SUGGEST_RE.search(t):
-        return "unknown"
-
     wants_food = bool(_FOOD_RE.search(t))
     wants_act = bool(_ACT_RE.search(t))
+
+    category_like = len(t) <= 50 and (wants_food or wants_act)
+    asking_for_places = bool(_SUGGEST_RE.search(t)) or bool(_ASK_PLACES_RE.search(t)) or category_like
+
+    if not asking_for_places:
+        return "unknown"
 
     if wants_food and wants_act:
         return "both"
@@ -129,30 +182,16 @@ def _suggestion_mode(msg: str) -> str:
 
 
 def strip_markdown(text: str) -> str:
-    """
-    Removes markdown formatting so Flutter chat bubbles don't show raw ###, **, [x](y), etc.
-    Keeps the text meaning, removes formatting.
-    """
     if not text:
         return ""
 
-    # Headings
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
-
-    # Bold/italic
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"\*(.*?)\*", r"\1", text)
-
-    # Links: [label](url) -> label
     text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
-
-    # Bullets / numbered lists
     text = re.sub(r"^\s*[-*]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
-
-    # Extra whitespace cleanup
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-
     return text
 
 
@@ -184,6 +223,11 @@ def _dedupe_places(places: list[dict]) -> list[dict]:
         seen.add(key)
         out.append(p)
     return out
+
+
+def _pick_reply(choices: list[str]) -> str:
+    # varied responses without looking robotic
+    return random.choice(choices) if choices else ""
 
 
 # -----------------------
@@ -507,6 +551,26 @@ Formatting rules (STRICT):
 """
 
 
+def _reply_for_mode(mode: str) -> str:
+    if mode == "restaurant":
+        return _pick_reply([
+            "Here are some restaurant picks in Lebanon based on your preferences. You can add them from the Trip/Planner screen.",
+            "I found some restaurant options in Lebanon that match your preferences. Add any of them from the Trip/Planner screen.",
+            "Based on your profile, these restaurants in Lebanon should fit. You can add them from the Trip/Planner screen.",
+        ])
+    if mode == "activity":
+        return _pick_reply([
+            "Here are some activity picks in Lebanon based on your preferences. You can add them from the Trip/Planner screen.",
+            "I found some activities in Lebanon that fit your vibe. Add any of them from the Trip/Planner screen.",
+            "Based on your profile, these activities in Lebanon are a good match. You can add them from the Trip/Planner screen.",
+        ])
+    return _pick_reply([
+        "Here are some picks in Lebanon based on your preferences. You can add them from the Trip/Planner screen.",
+        "I found a few options in Lebanon that match your preferences. You can add them from the Trip/Planner screen.",
+        "Based on your profile, here are some suggestions in Lebanon. You can add them from the Trip/Planner screen.",
+    ])
+
+
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     msg = (req.message or "").strip()
@@ -517,12 +581,33 @@ def chat(req: ChatRequest):
 
     # Fast path: greetings / small talk => no tools, no place spam
     if _is_small_talk(msg):
-        return {"reply": "Hey! What are you in the mood for — food, activities, or both?", "places": []}
+        return {"reply": _pick_reply([
+            "Hey! What are you in the mood for — food, activities, or both?",
+            "Hey! Want restaurants, activities, or both?",
+            "Hi! Tell me what you feel like doing — eating, going out, or both?",
+        ]), "places": []}
 
-    # Fast path: suggestion requests => deterministic restaurant vs activity vs both
+    # Determine location hint from message if user provided one
+    msg_loc_hint = _extract_location_hint(msg)
+    effective_loc = msg_loc_hint or req.location_hint or "Lebanon"
+
+    # Fast path: suggestion / category requests => deterministic routing
     mode = _suggestion_mode(msg)
     if mode in ("restaurant", "activity", "both"):
         places_out: list[dict] = []
+
+        # Nightlife should prefer Google results (Firestore likely weak here)
+        if mode in ("activity", "both") and _NIGHTLIFE_RE.search(msg):
+            places_out.extend(_google_search_lebanon(query=msg, location_hint=effective_loc, limit=limit))
+            places_out = _dedupe_places(places_out)
+            return {
+                "reply": _pick_reply([
+                    "Based on available data, here are some nightlife options in Lebanon. You can add them from the Trip/Planner screen.",
+                    "Here are some nightlife spots in Lebanon that match what you asked for. You can add them from the Trip/Planner screen.",
+                    "I pulled some nightlife options in Lebanon based on available data. You can add them from the Trip/Planner screen.",
+                ]),
+                "places": places_out
+            }
 
         if mode in ("restaurant", "both"):
             places_out.extend(_firestore_cards(
@@ -532,7 +617,7 @@ def chat(req: ChatRequest):
                 limit=limit,
                 user_latitude=req.latitude,
                 user_longitude=req.longitude,
-                location_hint=req.location_hint,
+                location_hint=effective_loc,
             ))
 
         if mode in ("activity", "both"):
@@ -543,27 +628,24 @@ def chat(req: ChatRequest):
                 limit=limit,
                 user_latitude=req.latitude,
                 user_longitude=req.longitude,
-                location_hint=req.location_hint,
+                location_hint=effective_loc,
             ))
 
         places_out = _dedupe_places(places_out)
 
-        if mode == "restaurant":
-            reply = "Based on your preferences, here are some restaurant suggestions in Lebanon. You can add them from the Trip/Planner screen."
-        elif mode == "activity":
-            reply = "Based on your preferences, here are some activity suggestions in Lebanon. You can add them from the Trip/Planner screen."
-        else:
-            reply = "Based on your preferences, here are some suggestions in Lebanon. You can add them from the Trip/Planner screen."
+        return {"reply": _reply_for_mode(mode), "places": places_out}
 
-        return {"reply": reply, "places": places_out}
-
-    # Suggestion request but unclear type => ask one question, no tools
-    if _SUGGEST_RE.search(msg) and mode == "unknown":
-        return {"reply": "Sure — do you want restaurant suggestions, activity suggestions, or both?", "places": []}
+    # If it's asking for places but unclear type => ask one question, no tools
+    if (_SUGGEST_RE.search(msg) or _ASK_PLACES_RE.search(msg)) and mode == "unknown":
+        return {"reply": _pick_reply([
+            "Sure — do you want restaurant suggestions, activity suggestions, or both?",
+            "Got it. Are you looking for restaurants, activities, or both?",
+            "Tell me what you want: restaurants, activities, or both?",
+        ]), "places": []}
 
     # Otherwise: let OpenAI pick tools
     ctx = {
-        "location_hint": req.location_hint or "Lebanon",
+        "location_hint": effective_loc,
         "limit": limit,
         "latitude": req.latitude,
         "longitude": req.longitude,
@@ -600,7 +682,7 @@ def chat(req: ChatRequest):
             if fn == "google_specific_search":
                 tool_res = tool_google_specific_search(
                     query=args.get("query", ""),
-                    location_hint=args.get("location_hint") or req.location_hint,
+                    location_hint=args.get("location_hint") or effective_loc,
                     limit=args.get("limit", limit),
                 )
                 places_out = tool_res.get("places", [])
@@ -608,7 +690,7 @@ def chat(req: ChatRequest):
             elif fn == "google_place_details":
                 tool_res = tool_google_place_details(
                     query=args.get("query", ""),
-                    location_hint=args.get("location_hint") or req.location_hint,
+                    location_hint=args.get("location_hint") or effective_loc,
                 )
                 place = tool_res.get("place")
                 places_out = [place] if place else []
@@ -617,7 +699,7 @@ def chat(req: ChatRequest):
                 tool_res = tool_compare_places(
                     place_a=args.get("place_a", ""),
                     place_b=args.get("place_b", ""),
-                    location_hint=args.get("location_hint") or req.location_hint,
+                    location_hint=args.get("location_hint") or effective_loc,
                 )
                 comp = tool_res.get("comparison") or {}
                 a = comp.get("place_a")
@@ -635,7 +717,7 @@ def chat(req: ChatRequest):
                     limit=args.get("limit", limit),
                     user_latitude=req.latitude,
                     user_longitude=req.longitude,
-                    location_hint=req.location_hint,
+                    location_hint=effective_loc,
                 )
                 places_out = tool_res.get("places", [])
 
