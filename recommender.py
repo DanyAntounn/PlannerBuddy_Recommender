@@ -499,7 +499,7 @@ def within_radius_km(
     return haversine_km(user_lat, user_lon, place_lat, place_lon) <= float(radius_km)
 
 
-def pick_random_zone_center_from_candidates(
+'''def pick_random_zone_center_from_candidates(
     candidates: list[dict],
     seed: int | None = None
 ) -> tuple[float, float] | None:
@@ -516,7 +516,50 @@ def pick_random_zone_center_from_candidates(
             good.append((lat, lon))
     if not good:
         return None
-    return rng.choice(good)
+    return rng.choice(good) '''
+    
+def pick_random_zone_center_diverse(
+    scored: list[dict],
+    seed: int | None,
+    centers_k: int = 25,
+    min_spread_km: float = 8.0,
+) -> tuple[float, float] | None:
+    """
+    Picks a random zone center from a set of geographically spread-out candidates.
+    This avoids always landing in Beirut if your top-scored pool is Beirut-heavy.
+    """
+    rng = random.Random(seed)
+
+    # Build candidate list of items that have lat/lon
+    candidates = []
+    for item in scored:
+        p = item.get("profile") or {}
+        lat, lon = _get_lat_lon_from_profile(p)
+        if lat is not None and lon is not None:
+            candidates.append((lat, lon))
+
+    if not candidates:
+        return None
+
+    # Shuffle for randomness, then greedily keep spread-out centers
+    rng.shuffle(candidates)
+
+    centers: list[tuple[float, float]] = []
+    for lat, lon in candidates:
+        ok = True
+        for clat, clon in centers:
+            if haversine_km(lat, lon, clat, clon) < min_spread_km:
+                ok = False
+                break
+        if ok:
+            centers.append((lat, lon))
+        if len(centers) >= centers_k:
+            break
+
+    if not centers:
+        return None
+
+    return rng.choice(centers)
 
 def rank_places_from_firestore(
     collection_name: str,
@@ -583,7 +626,7 @@ def rank_places_from_firestore(
         # Choose center
         if zone_center is None:
             pool = scored[:max(zone_pool_size, top_n * 10)]
-            zone_used = pick_random_zone_center_from_candidates(pool, seed=zone_seed)
+            zone_used = pick_random_zone_center_diverse(pool, seed=zone_seed,centers_k=25,min_spread_km=8.0,)
         else:
             zone_used = zone_center
 
