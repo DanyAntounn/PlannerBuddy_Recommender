@@ -13,6 +13,7 @@ from fuzzywuzzy import fuzz
 from google.cloud import firestore
 from google.oauth2 import service_account
 from google.cloud.firestore_v1 import GeoPoint
+import random
 
 from nltk.corpus import wordnet as wn
 
@@ -476,6 +477,46 @@ def upsert_place_into_firestore(collection_name: str, place_details: dict, recom
 
     db.collection(collection_name).document(doc_id).set(update_data, merge=True)
     return doc_id, None
+    
+def _get_lat_lon_from_profile(place_profile: dict) -> tuple[float | None, float | None]:
+    lat = place_profile.get("latitude")
+    lon = place_profile.get("longitude")
+    if lat is None or lon is None:
+        return None, None
+    try:
+        return float(lat), float(lon)
+    except Exception:
+        return None, None
+
+
+def within_radius_km(
+    user_lat: float,
+    user_lon: float,
+    place_lat: float,
+    place_lon: float,
+    radius_km: float
+) -> bool:
+    return haversine_km(user_lat, user_lon, place_lat, place_lon) <= float(radius_km)
+
+
+def pick_random_zone_center_from_candidates(
+    candidates: list[dict],
+    seed: int | None = None
+) -> tuple[float, float] | None:
+    """
+    candidates: list of dicts that contain profile.latitude/profile.longitude (or already in profile)
+    Returns (lat, lon) of a randomly chosen candidate as the zone center.
+    """
+    rng = random.Random(seed)
+    good = []
+    for c in candidates:
+        p = c.get("profile") or {}
+        lat, lon = _get_lat_lon_from_profile(p)
+        if lat is not None and lon is not None:
+            good.append((lat, lon))
+    if not good:
+        return None
+    return rng.choice(good)
 
 def rank_places_from_firestore(
     collection_name: str,
@@ -487,6 +528,12 @@ def rank_places_from_firestore(
     user_longitude: float | None = None,
     force_location: bool = False,
     location_hint: str | None = None,
+
+    zone_mode: bool = False,
+    zone_radius_km: float = 8.0,
+    zone_center: tuple[float, float] | None = None,
+    zone_seed: int | None = None,
+    zone_pool_size: int = 250,
 ):
     docs = db.collection(collection_name).stream()
     q_tokens = preprocess_text(query)
@@ -528,7 +575,52 @@ def rank_places_from_firestore(
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
-    diversified = diversify_by_distance(scored, k=top_n, min_spread_km=10.0)
+
+    # -------------------------
+    # ZONE MODE (random pin + radius filter)
+    # -------------------------
+    if zone_mode and scored:
+        # Choose center
+        if zone_center is None:
+            pool = scored[:max(zone_pool_size, top_n * 10)]
+            zone_used = pick_random_zone_center_from_candidates(pool, seed=zone_seed)
+        else:
+            zone_used = zone_center
+
+        if zone_used is not None:
+            zlat, zlon = zone_used
+
+            zone_scored = []
+            for item in scored:
+                p = item.get("profile") or {}
+                plat, plon = _get_lat_lon_from_profile(p)
+                if plat is None or plon is None:
+                    continue
+                if within_radius_km(zlat, zlon, plat, plon, zone_radius_km):
+                    zone_scored.append(item)
+
+            # widen once if too small
+            if len(zone_scored) < max(3, top_n):
+                widened = float(zone_radius_km) * 1.8
+                zone_scored2 = []
+                for item in scored:
+                    p = item.get("profile") or {}
+                    plat, plon = _get_lat_lon_from_profile(p)
+                    if plat is None or plon is None:
+                        continue
+                    if within_radius_km(zlat, zlon, plat, plon, widened):
+                        zone_scored2.append(item)
+                if len(zone_scored2) >= len(zone_scored):
+                    zone_scored = zone_scored2
+
+            # fallback if still tiny
+            if len(zone_scored) >= max(3, top_n):
+                scored = zone_scored
+
+    # -------------------------
+    # Final selection
+    # -------------------------
+    diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)
     diversified = diversified[:top_n]
 
     # Only fills missing google_place_id, does NOT fetch photos here
@@ -542,6 +634,7 @@ def rank_places_from_firestore(
 
     return diversified
 
+
 # ========== Existing Firestore trip (fallback) ==========
 def firestore_trip_generate(
     user_food: dict,
@@ -554,7 +647,13 @@ def firestore_trip_generate(
 ):
     plan = []
 
+    # keywords used for matching (same logic you had)
     food_kw = " ".join(user_food.get("preferred_primary_features", [])[:2]) or "restaurant"
+    act_kw = " ".join(user_act.get("preferred_primary_features", [])[:3]) or "activity"
+
+    # Different random zones for restaurants vs activities
+    seed_base = int(time.time())
+
     top_restaurants = rank_places_from_firestore(
         collection_name="RestaurantsFinal",
         user_profile=user_food,
@@ -565,13 +664,21 @@ def firestore_trip_generate(
         user_longitude=user_longitude,
         force_location=False,
         location_hint=location,
+        zone_mode=True,
+        zone_radius_km=6.0,
+        zone_seed=seed_base + 1,
     )
+
     plan.append({
-        "requirement": {"type": "restaurant", "count": num_restaurants, "keywords": [food_kw], "location_hint": None},
+        "requirement": {
+            "type": "restaurant",
+            "count": num_restaurants,
+            "keywords": [food_kw],
+            "location_hint": None
+        },
         "recommendations": top_restaurants,
     })
 
-    act_kw = " ".join(user_act.get("preferred_primary_features", [])[:3]) or "activity"
     top_activities = rank_places_from_firestore(
         collection_name="ActivitiesFinal",
         user_profile=user_act,
@@ -582,13 +689,23 @@ def firestore_trip_generate(
         user_longitude=user_longitude,
         force_location=False,
         location_hint=location,
+        zone_mode=True,
+        zone_radius_km=10.0,
+        zone_seed=seed_base + 2,
     )
+
     plan.append({
-        "requirement": {"type": "activity", "count": num_activities, "keywords": [act_kw], "location_hint": None},
+        "requirement": {
+            "type": "activity",
+            "count": num_activities,
+            "keywords": [act_kw],
+            "location_hint": None
+        },
         "recommendations": top_activities,
     })
 
     return {"plan": plan}
+
 
 # ========== Query-driven Firestore trip ==========
 def firestore_trip_generate_from_query(
