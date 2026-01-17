@@ -370,10 +370,10 @@ def distance_bias_bonus(user_lat, user_lon, place_lat, place_lon) -> float:
     if user_lat is None or user_lon is None or place_lat is None or place_lon is None:
         return 0.0
     d = haversine_km(user_lat, user_lon, place_lat, place_lon)
-    if d <= 2:  return 1.5
-    if d <= 5:  return 1.0
-    if d <= 10: return 0.6
-    if d <= 20: return 0.3
+    if d <= 2:  return 0.15
+    if d <= 5:  return 0.1
+    if d <= 10: return 0.06
+    if d <= 20: return 0.03
     return 0.0
 
 def diversify_by_distance(candidates: list[dict], k: int, min_spread_km: float = 2.0) -> list[dict]:
