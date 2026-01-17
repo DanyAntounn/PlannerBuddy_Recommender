@@ -528,7 +528,7 @@ def rank_places_from_firestore(
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
-    diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)
+    diversified = diversify_by_distance(scored, k=top_n, min_spread_km=10.0)
     diversified = diversified[:top_n]
 
     # Only fills missing google_place_id, does NOT fetch photos here
