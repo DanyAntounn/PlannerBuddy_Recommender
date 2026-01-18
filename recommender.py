@@ -518,20 +518,22 @@ def within_radius_km(
         return None
     return rng.choice(good) '''
     
-def pick_random_zone_center_diverse(
+def pick_random_zone_center_diverse_excluding(
     scored: list[dict],
     seed: int | None,
+    used_centers: list[tuple[float, float]] | None = None,
     centers_k: int = 25,
     min_spread_km: float = 8.0,
+    avoid_within_km: float = 18.0,
 ) -> tuple[float, float] | None:
     """
-    Picks a random zone center from a set of geographically spread-out candidates.
-    This avoids always landing in Beirut if your top-scored pool is Beirut-heavy.
+    Picks a random zone center from a geographically spread-out candidate set,
+    and (optionally) avoids being too close to previously used zone centers.
     """
     rng = random.Random(seed)
+    used_centers = used_centers or []
 
-    # Build candidate list of items that have lat/lon
-    candidates = []
+    candidates: list[tuple[float, float]] = []
     for item in scored:
         p = item.get("profile") or {}
         lat, lon = _get_lat_lon_from_profile(p)
@@ -541,9 +543,9 @@ def pick_random_zone_center_diverse(
     if not candidates:
         return None
 
-    # Shuffle for randomness, then greedily keep spread-out centers
     rng.shuffle(candidates)
 
+    # Greedily keep spread-out centers
     centers: list[tuple[float, float]] = []
     for lat, lon in candidates:
         ok = True
@@ -559,7 +561,20 @@ def pick_random_zone_center_diverse(
     if not centers:
         return None
 
-    return rng.choice(centers)
+    # Filter out centers too close to already used centers
+    filtered: list[tuple[float, float]] = []
+    for lat, lon in centers:
+        too_close = False
+        for ulat, ulon in used_centers:
+            if haversine_km(lat, lon, ulat, ulon) < avoid_within_km:
+                too_close = True
+                break
+        if not too_close:
+            filtered.append((lat, lon))
+
+    pick_from = filtered if filtered else centers
+    return rng.choice(pick_from)
+
 
 def rank_places_from_firestore(
     collection_name: str,
@@ -578,15 +593,19 @@ def rank_places_from_firestore(
     zone_seed: int | None = None,
     zone_pool_size: int = 250,
 
-    exclude_place_ids: list[str] | None = None,   # NEW
-    exclude_doc_ids: list[str] | None = None,     # NEW (fallback)
+    exclude_place_ids: list[str] | None = None,
+    exclude_doc_ids: list[str] | None = None,
+
+    # NEW: to prevent clumping (avoid previously used pins)
+    used_zone_centers: list[tuple[float, float]] | None = None,
+    avoid_zone_centers_within_km: float = 18.0,
 ):
     exclude_place_ids = set((exclude_place_ids or []))
     exclude_doc_ids = set((exclude_doc_ids or []))
 
     docs = db.collection(collection_name).stream()
     q_tokens = preprocess_text(query)
-    scored = []
+    scored: list[dict] = []
 
     loc_lower = (location_hint or "").strip().lower()
 
@@ -613,11 +632,13 @@ def rank_places_from_firestore(
 
         s = match_user_to_place(user_profile, place_profile, recommendation_type)
 
+        # keyword boost
         if q_tokens:
-            combined_features = place_profile["primary_features"] + place_profile["secondary_features"]
+            combined_features = (place_profile.get("primary_features") or []) + (place_profile.get("secondary_features") or [])
             if any(qt in combined_features for qt in q_tokens):
                 s += 4
 
+        # small distance bias (as you had)
         if not force_location:
             s += distance_bias_bonus(
                 user_latitude, user_longitude,
@@ -625,7 +646,7 @@ def rank_places_from_firestore(
             )
 
         scored.append({
-            "name": place_profile["name"],
+            "name": place_profile.get("name"),
             "score": float(s),
             "profile": place_profile,
             "doc_id": snap.id,
@@ -633,21 +654,30 @@ def rank_places_from_firestore(
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
+    zone_used: tuple[float, float] | None = None
+
     # -------------------------
     # ZONE MODE (random pin + radius filter)
     # -------------------------
     if zone_mode and scored:
         # Choose center
-        if zone_center is None:
-            pool = scored[:max(zone_pool_size, top_n * 10)]
-            zone_used = pick_random_zone_center_diverse(pool, seed=zone_seed,centers_k=25,min_spread_km=8.0,)
-        else:
+        if zone_center is not None:
             zone_used = zone_center
+        else:
+            pool = scored[:max(zone_pool_size, top_n * 10)]
+            zone_used = pick_random_zone_center_diverse_excluding(
+                pool,
+                seed=zone_seed,
+                used_centers=used_zone_centers,
+                centers_k=25,
+                min_spread_km=8.0,
+                avoid_within_km=float(avoid_zone_centers_within_km),
+            )
 
         if zone_used is not None:
             zlat, zlon = zone_used
 
-            zone_scored = []
+            zone_scored: list[dict] = []
             for item in scored:
                 p = item.get("profile") or {}
                 plat, plon = _get_lat_lon_from_profile(p)
@@ -659,7 +689,7 @@ def rank_places_from_firestore(
             # widen once if too small
             if len(zone_scored) < max(3, top_n):
                 widened = float(zone_radius_km) * 1.8
-                zone_scored2 = []
+                zone_scored2: list[dict] = []
                 for item in scored:
                     p = item.get("profile") or {}
                     plat, plon = _get_lat_lon_from_profile(p)
@@ -667,10 +697,11 @@ def rank_places_from_firestore(
                         continue
                     if within_radius_km(zlat, zlon, plat, plon, widened):
                         zone_scored2.append(item)
+
                 if len(zone_scored2) >= len(zone_scored):
                     zone_scored = zone_scored2
 
-            # fallback if still tiny
+            # only replace scored if the zone has enough items
             if len(zone_scored) >= max(3, top_n):
                 scored = zone_scored
 
@@ -679,6 +710,7 @@ def rank_places_from_firestore(
     # -------------------------
     diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)[:top_n]
 
+    # Only fills missing google_place_id (no photo fetching here)
     for item in diversified:
         ensure_image_url_for_firestore_doc(
             collection_name,
@@ -687,7 +719,13 @@ def rank_places_from_firestore(
             location_hint=location_hint,
         )
 
+    # expose zone_used so the generator can avoid clumping across picks
+    if zone_mode and zone_used is not None:
+        for item in diversified:
+            item["zone_used"] = {"lat": float(zone_used[0]), "lon": float(zone_used[1])}
+
     return diversified
+
 
 # ========== Existing Firestore trip (fallback) ==========
 def firestore_trip_generate(
@@ -699,16 +737,20 @@ def firestore_trip_generate(
     user_latitude: float | None = None,
     user_longitude: float | None = None,
 ):
-    plan = []
+    plan: list[dict] = []
 
     food_kw = " ".join(user_food.get("preferred_primary_features", [])[:2]) or "restaurant"
     act_kw = " ".join(user_act.get("preferred_primary_features", [])[:3]) or "activity"
 
-    # Use milliseconds so back-to-back requests are different
+    # milliseconds so back-to-back requests differ
     seed_base = int(time.time() * 1000)
 
+    # prevent duplicates across whole trip
     chosen_place_ids: set[str] = set()
     chosen_doc_ids: set[str] = set()
+
+    # prevent clumping: keep zone centers used so far
+    used_zone_centers: list[tuple[float, float]] = []
 
     # -------- Restaurants: each item gets its own random zone --------
     restaurants: list[dict] = []
@@ -726,10 +768,13 @@ def firestore_trip_generate(
 
             zone_mode=True,
             zone_radius_km=6.0,
-            zone_seed=seed_base + 1000 + i,  # DIFFERENT SEED PER ITEM
+            zone_seed=seed_base + 1000 + i,
 
             exclude_place_ids=list(chosen_place_ids),
             exclude_doc_ids=list(chosen_doc_ids),
+
+            used_zone_centers=used_zone_centers,
+            avoid_zone_centers_within_km=18.0,
         )
 
         if not recs:
@@ -738,11 +783,17 @@ def firestore_trip_generate(
         pick = recs[0]
         restaurants.append(pick)
 
+        # track duplicates
         gpid = (pick.get("profile") or {}).get("google_place_id")
         if gpid:
             chosen_place_ids.add(gpid)
         if pick.get("doc_id"):
             chosen_doc_ids.add(pick["doc_id"])
+
+        # track used zone center (pin)
+        zu = pick.get("zone_used")
+        if zu and "lat" in zu and "lon" in zu:
+            used_zone_centers.append((float(zu["lat"]), float(zu["lon"])))
 
     plan.append({
         "requirement": {"type": "restaurant", "count": num_restaurants, "keywords": [food_kw], "location_hint": None},
@@ -765,10 +816,13 @@ def firestore_trip_generate(
 
             zone_mode=True,
             zone_radius_km=10.0,
-            zone_seed=seed_base + 2000 + i,  # DIFFERENT SEED PER ITEM
+            zone_seed=seed_base + 2000 + i,
 
             exclude_place_ids=list(chosen_place_ids),
             exclude_doc_ids=list(chosen_doc_ids),
+
+            used_zone_centers=used_zone_centers,
+            avoid_zone_centers_within_km=25.0,
         )
 
         if not recs:
@@ -777,11 +831,17 @@ def firestore_trip_generate(
         pick = recs[0]
         activities.append(pick)
 
+        # track duplicates
         gpid = (pick.get("profile") or {}).get("google_place_id")
         if gpid:
             chosen_place_ids.add(gpid)
         if pick.get("doc_id"):
             chosen_doc_ids.add(pick["doc_id"])
+
+        # track used zone center (pin)
+        zu = pick.get("zone_used")
+        if zu and "lat" in zu and "lon" in zu:
+            used_zone_centers.append((float(zu["lat"]), float(zu["lon"])))
 
     plan.append({
         "requirement": {"type": "activity", "count": num_activities, "keywords": [act_kw], "location_hint": None},
@@ -789,6 +849,7 @@ def firestore_trip_generate(
     })
 
     return {"plan": plan}
+
 
 
 # ========== Query-driven Firestore trip ==========
