@@ -577,7 +577,13 @@ def rank_places_from_firestore(
     zone_center: tuple[float, float] | None = None,
     zone_seed: int | None = None,
     zone_pool_size: int = 250,
+
+    exclude_place_ids: list[str] | None = None,   # NEW
+    exclude_doc_ids: list[str] | None = None,     # NEW (fallback)
 ):
+    exclude_place_ids = set((exclude_place_ids or []))
+    exclude_doc_ids = set((exclude_doc_ids or []))
+
     docs = db.collection(collection_name).stream()
     q_tokens = preprocess_text(query)
     scored = []
@@ -585,9 +591,18 @@ def rank_places_from_firestore(
     loc_lower = (location_hint or "").strip().lower()
 
     for snap in docs:
-        data = snap.to_dict() or {}
+        if snap.id in exclude_doc_ids:
+            continue
 
+        data = snap.to_dict() or {}
         if "primary_features" not in data or "avg_sentiment" not in data:
+            continue
+
+        place_profile = build_profile_from_firestore_doc(data, recommendation_type)
+
+        # Skip if google_place_id already shown
+        gpid = place_profile.get("google_place_id")
+        if gpid and gpid in exclude_place_ids:
             continue
 
         if force_location and loc_lower:
@@ -596,7 +611,6 @@ def rank_places_from_firestore(
             if loc_lower not in addr and loc_lower not in name:
                 continue
 
-        place_profile = build_profile_from_firestore_doc(data, recommendation_type)
         s = match_user_to_place(user_profile, place_profile, recommendation_type)
 
         if q_tokens:
@@ -663,10 +677,8 @@ def rank_places_from_firestore(
     # -------------------------
     # Final selection
     # -------------------------
-    diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)
-    diversified = diversified[:top_n]
+    diversified = diversify_by_distance(scored, k=top_n, min_spread_km=2.0)[:top_n]
 
-    # Only fills missing google_place_id, does NOT fetch photos here
     for item in diversified:
         ensure_image_url_for_firestore_doc(
             collection_name,
@@ -676,7 +688,6 @@ def rank_places_from_firestore(
         )
 
     return diversified
-
 
 # ========== Existing Firestore trip (fallback) ==========
 def firestore_trip_generate(
@@ -690,61 +701,91 @@ def firestore_trip_generate(
 ):
     plan = []
 
-    # keywords used for matching (same logic you had)
     food_kw = " ".join(user_food.get("preferred_primary_features", [])[:2]) or "restaurant"
     act_kw = " ".join(user_act.get("preferred_primary_features", [])[:3]) or "activity"
 
-    # Different random zones for restaurants vs activities
-    seed_base = int(time.time())
+    # Use milliseconds so back-to-back requests are different
+    seed_base = int(time.time() * 1000)
 
-    top_restaurants = rank_places_from_firestore(
-        collection_name="RestaurantsFinal",
-        user_profile=user_food,
-        recommendation_type="food",
-        top_n=num_restaurants,
-        query=food_kw,
-        user_latitude=user_latitude,
-        user_longitude=user_longitude,
-        force_location=False,
-        location_hint=location,
-        zone_mode=True,
-        zone_radius_km=6.0,
-        zone_seed=seed_base + 1,
-    )
+    chosen_place_ids: set[str] = set()
+    chosen_doc_ids: set[str] = set()
+
+    # -------- Restaurants: each item gets its own random zone --------
+    restaurants: list[dict] = []
+    for i in range(int(num_restaurants)):
+        recs = rank_places_from_firestore(
+            collection_name="RestaurantsFinal",
+            user_profile=user_food,
+            recommendation_type="food",
+            top_n=1,
+            query=food_kw,
+            user_latitude=user_latitude,
+            user_longitude=user_longitude,
+            force_location=False,
+            location_hint=location,
+
+            zone_mode=True,
+            zone_radius_km=6.0,
+            zone_seed=seed_base + 1000 + i,  # DIFFERENT SEED PER ITEM
+
+            exclude_place_ids=list(chosen_place_ids),
+            exclude_doc_ids=list(chosen_doc_ids),
+        )
+
+        if not recs:
+            continue
+
+        pick = recs[0]
+        restaurants.append(pick)
+
+        gpid = (pick.get("profile") or {}).get("google_place_id")
+        if gpid:
+            chosen_place_ids.add(gpid)
+        if pick.get("doc_id"):
+            chosen_doc_ids.add(pick["doc_id"])
 
     plan.append({
-        "requirement": {
-            "type": "restaurant",
-            "count": num_restaurants,
-            "keywords": [food_kw],
-            "location_hint": None
-        },
-        "recommendations": top_restaurants,
+        "requirement": {"type": "restaurant", "count": num_restaurants, "keywords": [food_kw], "location_hint": None},
+        "recommendations": restaurants,
     })
 
-    top_activities = rank_places_from_firestore(
-        collection_name="ActivitiesFinal",
-        user_profile=user_act,
-        recommendation_type="activity",
-        top_n=num_activities,
-        query=act_kw,
-        user_latitude=user_latitude,
-        user_longitude=user_longitude,
-        force_location=False,
-        location_hint=location,
-        zone_mode=True,
-        zone_radius_km=10.0,
-        zone_seed=seed_base + 2,
-    )
+    # -------- Activities: each item gets its own random zone --------
+    activities: list[dict] = []
+    for i in range(int(num_activities)):
+        recs = rank_places_from_firestore(
+            collection_name="ActivitiesFinal",
+            user_profile=user_act,
+            recommendation_type="activity",
+            top_n=1,
+            query=act_kw,
+            user_latitude=user_latitude,
+            user_longitude=user_longitude,
+            force_location=False,
+            location_hint=location,
+
+            zone_mode=True,
+            zone_radius_km=10.0,
+            zone_seed=seed_base + 2000 + i,  # DIFFERENT SEED PER ITEM
+
+            exclude_place_ids=list(chosen_place_ids),
+            exclude_doc_ids=list(chosen_doc_ids),
+        )
+
+        if not recs:
+            continue
+
+        pick = recs[0]
+        activities.append(pick)
+
+        gpid = (pick.get("profile") or {}).get("google_place_id")
+        if gpid:
+            chosen_place_ids.add(gpid)
+        if pick.get("doc_id"):
+            chosen_doc_ids.add(pick["doc_id"])
 
     plan.append({
-        "requirement": {
-            "type": "activity",
-            "count": num_activities,
-            "keywords": [act_kw],
-            "location_hint": None
-        },
-        "recommendations": top_activities,
+        "requirement": {"type": "activity", "count": num_activities, "keywords": [act_kw], "location_hint": None},
+        "recommendations": activities,
     })
 
     return {"plan": plan}
