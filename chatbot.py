@@ -103,7 +103,9 @@ _LOCATION_HINT_RE = re.compile(
     re.IGNORECASE
 )
 
-_COMPARE_RE = re.compile(r"\b(compare|comparison|vs|versus|difference between)\b", re.IGNORECASE)
+
+_COMPARE_RE = re.compile(r"\b(compare|comparison|vs|versus|difference between|which is better)\b", re.IGNORECASE)
+
 
 
 def _extract_location_hint(msg: str) -> Optional[str]:
@@ -207,40 +209,63 @@ def _pick_reply(choices: list[str]) -> str:
     return random.choice(choices) if choices else ""
 
 
+# 2) Replace _try_parse_compare with this (adds "to", "with", "between", "or")
 def _try_parse_compare(msg: str) -> Optional[tuple[str, str]]:
     t = (msg or "").strip()
     if not t:
         return None
 
-    m = re.split(r"\s+(?:vs|versus)\s+", t, flags=re.IGNORECASE)
-    if len(m) == 2:
-        a, b = m[0].strip(), m[1].strip()
-        a = re.sub(r"^(give me|show me|i want|can you|please)\s*", "", a, flags=re.IGNORECASE).strip()
+    # Normalize some leading phrasing
+    t2 = re.sub(
+        r"^(give me|show me|i want|can you|please)\s*",
+        "",
+        t,
+        flags=re.IGNORECASE
+    ).strip()
+
+    # difference between A and B
+    m = re.search(r"\bdifference between\s+(.+?)\s+and\s+(.+)$", t2, flags=re.IGNORECASE)
+    if m:
+        a = (m.group(1) or "").strip()
+        b = (m.group(2) or "").strip()
+        b = re.sub(r"[?.!]+$", "", b).strip()
+        return (a, b) if a and b else None
+
+    # compare A vs B / A versus B
+    parts = re.split(r"\s+(?:vs|versus)\s+", t2, flags=re.IGNORECASE)
+    if len(parts) == 2:
+        a, b = parts[0].strip(), parts[1].strip()
         a = re.sub(r"^(a\s*)?(comparison|compare)\s*(on|between)?\s*", "", a, flags=re.IGNORECASE).strip()
         b = re.sub(r"[?.!]+$", "", b).strip()
-        if a and b:
-            return a, b
+        return (a, b) if a and b else None
 
-    low = t.lower()
-    if " and " in low:
-        parts = re.split(r"\s+and\s+", t, maxsplit=1, flags=re.IGNORECASE)
-        if len(parts) == 2:
-            a, b = parts[0].strip(), parts[1].strip()
-            a = re.sub(r"^(give me|show me|i want|can you|please)\s*", "", a, flags=re.IGNORECASE).strip()
-            a = re.sub(r"^(a\s*)?(comparison|compare)\s*(on|between)?\s*", "", a, flags=re.IGNORECASE).strip()
-            b = re.sub(r"[?.!]+$", "", b).strip()
-            if a and b:
-                return a, b
-
-    m2 = re.search(r"difference between\s+(.+?)\s+and\s+(.+)$", t, flags=re.IGNORECASE)
-    if m2:
-        a = (m2.group(1) or "").strip()
-        b = (m2.group(2) or "").strip()
+    # compare A to B / compare A with B
+    m = re.search(r"\bcompare\s+(.+?)\s+(?:to|with)\s+(.+)$", t2, flags=re.IGNORECASE)
+    if m:
+        a = (m.group(1) or "").strip()
+        b = (m.group(2) or "").strip()
         b = re.sub(r"[?.!]+$", "", b).strip()
-        if a and b:
-            return a, b
+        return (a, b) if a and b else None
+
+    # comparison between A and B
+    m = re.search(r"\bcomparison\s+(?:between|of)\s+(.+?)\s+and\s+(.+)$", t2, flags=re.IGNORECASE)
+    if m:
+        a = (m.group(1) or "").strip()
+        b = (m.group(2) or "").strip()
+        b = re.sub(r"[?.!]+$", "", b).strip()
+        return (a, b) if a and b else None
+
+    # A and B / A or B (when user says "which is better A or B")
+    m = re.search(r"\b(.+?)\s+(?:and|or)\s+(.+)$", t2, flags=re.IGNORECASE)
+    if m and _COMPARE_RE.search(t2):
+        a = (m.group(1) or "").strip()
+        b = (m.group(2) or "").strip()
+        a = re.sub(r"^(which is better|better|compare)\s+", "", a, flags=re.IGNORECASE).strip()
+        b = re.sub(r"[?.!]+$", "", b).strip()
+        return (a, b) if a and b else None
 
     return None
+
 
 
 def _google_search_lebanon(query: str, location_hint: Optional[str], limit: int) -> list[dict]:
@@ -615,21 +640,25 @@ def chat(req: ChatRequest):
 
     wants_more = bool(_MORE_RE.search(msg))
 
-    if _COMPARE_RE.search(msg):
-        pair = _try_parse_compare(msg)
-        if pair:
-            a, b = pair
-            comp_res = tool_compare_places(a, b, location_hint=effective_loc)
-            comp = (comp_res.get("comparison") or {})
-            summary = (comp.get("summary") or "").strip()
-            places_out = [p for p in [comp.get("place_a"), comp.get("place_b")] if p]
+   # 3) In chat(), KEEP your effective_loc code, then REPLACE your compare block with this:
+if _COMPARE_RE.search(msg):
+    pair = _try_parse_compare(msg)
+    if pair:
+        a, b = pair
+        comp_res = tool_compare_places(a, b, location_hint=effective_loc)
+        comp = (comp_res.get("comparison") or {})
+        places_out = [p for p in [comp.get("place_a"), comp.get("place_b")] if p]
 
-            reply = summary if summary else "Based on available data, here’s what I found for both places in Lebanon."
-            if len(reply) > 220:
-                reply = reply[:220].rstrip() + "..."
-            return {"reply": reply, "places": places_out}
+        # Deterministic reply ONLY (no “known for” hallucinations)
+        summary = (comp.get("summary") or "").strip()
+        reply = summary if summary else "Based on available data, I found both places in Lebanon, but I couldn’t compute a rating/review comparison."
+        if len(reply) > 220:
+            reply = reply[:220].rstrip() + "..."
+        return {"reply": reply, "places": places_out}
 
-    mode = _suggestion_mode(msg, fallback_last_mode=req.last_mode)
+    # If compare intent but parsing failed, don't let it fall into recommendations
+    return {"reply": "Tell me the two place names (example: Place A vs Place B).", "places": []}
+
 
     if wants_more and mode == "unknown":
         return {"reply": _pick_reply([
