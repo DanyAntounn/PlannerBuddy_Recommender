@@ -929,26 +929,57 @@ def firestore_trip_generate_from_query(
     query: str,
     user_food: dict,
     user_act: dict,
+    personality_profile: dict | None = None,
     user_latitude: float | None = None,
     user_longitude: float | None = None,
 ):
     """
     Query-driven trip generator.
     - Uses OpenAI to extract requirements
-    - Searches **Google Places API only**, ignores Firestore.
+    - Searches Google Places API
+    - NOW: applies personality_profile to user_food/user_act before scoring
     """
+
+    # Apply personality -> enrich user profiles (ambiance, thresholds, cultural boosts, etc.)
+    if personality_profile:
+        try:
+            user_food, user_act = apply_personality_to_profiles(
+                personality_profile,
+                user_food,
+                user_act,
+            )
+        except Exception:
+            pass
+
+    # Strip generic placeholders that cannot match extracted features
+    def _strip_generic(user_profile: dict):
+        p1 = user_profile.get("preferred_primary_features", []) or []
+        p2 = user_profile.get("preferred_secondary_features", []) or []
+        user_profile["preferred_primary_features"] = [x for x in p1 if x not in ("restaurant", "activity")]
+        user_profile["preferred_secondary_features"] = [x for x in p2 if x not in ("restaurant", "activity")]
+        return user_profile
+
+    user_food = _strip_generic(user_food)
+    user_act = _strip_generic(user_act)
+
     extraction = extract_requirements_with_openai(query)
     requirements = extraction.get("requirements", []) or []
 
     if not requirements:
-        # Fallback to Firestore if extraction fails
-        return {"extracted": extraction, "plan": firestore_trip_generate(
-            user_food, user_act,
-            num_restaurants=1, num_activities=2,
-            location="Beirut, Lebanon",
-            user_latitude=user_latitude,
-            user_longitude=user_longitude,
-        )["plan"]}
+        # Fallback to Firestore trip if extraction fails
+        return {
+            "extracted": extraction,
+            "plan": firestore_trip_generate(
+                user_food=user_food,
+                user_act=user_act,
+                personality_profile=personality_profile,
+                num_restaurants=1,
+                num_activities=2,
+                location="Beirut, Lebanon",
+                user_latitude=user_latitude,
+                user_longitude=user_longitude,
+            )["plan"]
+        }
 
     gps = GooglePlacesService()
     plan = []
@@ -961,21 +992,39 @@ def firestore_trip_generate_from_query(
 
         query_str = " ".join(keywords).strip() or typ
 
-        # --- GOOGLE PLACES ONLY ---
+        # --- GOOGLE PLACES SEARCH ---
         results = gps.text_search(query_str, location_hint, max_pages=1)[:count]
 
         recommendations = []
         for r in results:
-            profile = extract_place_profile(r, "food" if typ == "restaurant" else "activity")
-            score = match_user_to_place(
-                user_food if typ=="restaurant" else user_act,
-                profile,
-                typ
+            # Build place profile from Google details
+            place_profile = extract_place_profile(
+                r,
+                "food" if typ == "restaurant" else "activity"
             )
+
+            # Optional: distance bias if user coords exist and Google returned coords
+            if user_latitude is not None and user_longitude is not None:
+                s = match_user_to_place(
+                    user_food if typ == "restaurant" else user_act,
+                    place_profile,
+                    typ
+                )
+                s += distance_bias_bonus(
+                    user_latitude, user_longitude,
+                    place_profile.get("latitude"), place_profile.get("longitude"),
+                )
+            else:
+                s = match_user_to_place(
+                    user_food if typ == "restaurant" else user_act,
+                    place_profile,
+                    typ
+                )
+
             recommendations.append({
                 "name": r.get("name"),
-                "score": round(float(score), 2),
-                "profile": profile
+                "score": round(float(s), 2),
+                "profile": place_profile
             })
 
         plan.append({
@@ -990,6 +1039,7 @@ def firestore_trip_generate_from_query(
         })
 
     return {"extracted": extraction, "plan": plan}
+
 
 # ========== Firestore enrichment (unchanged) ==========
 def build_place_dict_from_firestore_doc(doc_data: dict) -> dict:
