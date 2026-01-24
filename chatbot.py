@@ -1,29 +1,4 @@
 # chatbot.py
-"""
-PlannerBuddy Chatbot Router
-- Rule:
-  - Specific place/entity -> Google Places (via recommender.places_service)
-  - Preference-based recommendation -> Firestore-first (via recommender.rank_places_from_firestore)
-- Tools:
-  - google_specific_search
-  - google_place_details
-  - compare_places
-  - firestore_recommend
-- Includes:
-  - Locked system prompt (user cannot change it)
-  - "Cannot add places to trips from chatbot" limitation
-  - Accuracy disclaimer
-- Fixes:
-  - Greetings/small talk should not trigger tools
-  - Reply must be plain text (no markdown)
-  - Suggestion requests detect restaurant vs activity vs both
-  - "more/other/different/random" now produces new results:
-      - supports exclude_place_ids
-      - supports zone_mode/zone_radius_km/zone_seed
-      - supports last_mode fallback
-  - Prevents long LLM formatted lists: server writes short reply, UI shows cards
-"""
-
 import os
 import json
 import re
@@ -37,8 +12,8 @@ from openai import OpenAI
 from fuzzywuzzy import fuzz
 
 from recommender import (
-    places_service,                 # GooglePlacesService instance
-    rank_places_from_firestore,      # Firestore-first ranking (supports zone_mode)
+    places_service,
+    rank_places_from_firestore,
     PUBLIC_BASE_URL,
 )
 
@@ -46,9 +21,6 @@ router = APIRouter()
 _openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-# -----------------------
-# Pydantic Models
-# -----------------------
 class UserProfile(BaseModel):
     preferred_primary_features: list[str]
     ambiance: list[str]
@@ -66,7 +38,6 @@ class ChatRequest(BaseModel):
     location_hint: Optional[str] = "Lebanon"
     limit: int = 5
 
-    # NEW: helps "give me more" work consistently
     last_mode: Optional[Literal["restaurant", "activity", "both"]] = None
     exclude_place_ids: list[str] = []
 
@@ -76,9 +47,6 @@ class ChatResponse(BaseModel):
     places: list[dict] = []
 
 
-# -----------------------
-# Small talk + formatting helpers
-# -----------------------
 _GREETING_RE = re.compile(
     r"^(hi|hello|hey|yo|sup|good (morning|afternoon|evening)|hola|salut|bonjour)\b",
     re.IGNORECASE,
@@ -88,9 +56,6 @@ _SMALL_TALK_EXACT = {
     "lol", "lmao", "haha", "yup", "yep", "nope"
 }
 
-# -----------------------
-# Intent detection (improved)
-# -----------------------
 _SUGGEST_RE = re.compile(
     r"\b(suggest|recommend|recommendation|recommendations|ideas|options|where should i|what should i|"
     r"any (good|nice|cool)|looking for|searching for|find me|show me|give me)\b",
@@ -138,6 +103,8 @@ _LOCATION_HINT_RE = re.compile(
     re.IGNORECASE
 )
 
+_COMPARE_RE = re.compile(r"\b(compare|comparison|vs|versus|difference between)\b", re.IGNORECASE)
+
 
 def _extract_location_hint(msg: str) -> Optional[str]:
     t = (msg or "").strip()
@@ -167,14 +134,6 @@ def _is_small_talk(msg: str) -> bool:
 
 
 def _suggestion_mode(msg: str, fallback_last_mode: Optional[str] = None) -> str:
-    """
-    Returns: 'restaurant' | 'activity' | 'both' | 'unknown'
-    Works for:
-      - explicit suggest: "recommend restaurants"
-      - category-only replies: "night clubs", "restaurants", "hiking"
-      - questions: "where should i go in jbeil"
-      - "more/other" -> uses last_mode if provided
-    """
     t = (msg or "").strip()
     if not t:
         return "unknown"
@@ -195,7 +154,6 @@ def _suggestion_mode(msg: str, fallback_last_mode: Optional[str] = None) -> str:
     if wants_act:
         return "activity"
 
-    # If user says "more/other/different" but doesn't specify type, use last_mode
     if _MORE_RE.search(t) and fallback_last_mode in {"restaurant", "activity", "both"}:
         return fallback_last_mode
 
@@ -205,7 +163,6 @@ def _suggestion_mode(msg: str, fallback_last_mode: Optional[str] = None) -> str:
 def strip_markdown(text: str) -> str:
     if not text:
         return ""
-
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"\*(.*?)\*", r"\1", text)
@@ -250,9 +207,42 @@ def _pick_reply(choices: list[str]) -> str:
     return random.choice(choices) if choices else ""
 
 
-# -----------------------
-# Google + Firestore helpers
-# -----------------------
+def _try_parse_compare(msg: str) -> Optional[tuple[str, str]]:
+    t = (msg or "").strip()
+    if not t:
+        return None
+
+    m = re.split(r"\s+(?:vs|versus)\s+", t, flags=re.IGNORECASE)
+    if len(m) == 2:
+        a, b = m[0].strip(), m[1].strip()
+        a = re.sub(r"^(give me|show me|i want|can you|please)\s*", "", a, flags=re.IGNORECASE).strip()
+        a = re.sub(r"^(a\s*)?(comparison|compare)\s*(on|between)?\s*", "", a, flags=re.IGNORECASE).strip()
+        b = re.sub(r"[?.!]+$", "", b).strip()
+        if a and b:
+            return a, b
+
+    low = t.lower()
+    if " and " in low:
+        parts = re.split(r"\s+and\s+", t, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            a, b = parts[0].strip(), parts[1].strip()
+            a = re.sub(r"^(give me|show me|i want|can you|please)\s*", "", a, flags=re.IGNORECASE).strip()
+            a = re.sub(r"^(a\s*)?(comparison|compare)\s*(on|between)?\s*", "", a, flags=re.IGNORECASE).strip()
+            b = re.sub(r"[?.!]+$", "", b).strip()
+            if a and b:
+                return a, b
+
+    m2 = re.search(r"difference between\s+(.+?)\s+and\s+(.+)$", t, flags=re.IGNORECASE)
+    if m2:
+        a = (m2.group(1) or "").strip()
+        b = (m2.group(2) or "").strip()
+        b = re.sub(r"[?.!]+$", "", b).strip()
+        if a and b:
+            return a, b
+
+    return None
+
+
 def _google_search_lebanon(query: str, location_hint: Optional[str], limit: int) -> list[dict]:
     q = (query or "").strip()
     if not q:
@@ -354,8 +344,6 @@ def _firestore_cards(
     rec_type = "food" if typ == "restaurant" else "activity"
 
     exclude_set = set((exclude_place_ids or []))
-
-    # Slightly over-fetch to allow filtering out excluded ids while still returning limit items
     fetch_n = min(10, max(limit, 1) + 4)
 
     recs = rank_places_from_firestore(
@@ -368,7 +356,6 @@ def _firestore_cards(
         user_longitude=user_longitude,
         force_location=False,
         location_hint=location_hint,
-
         zone_mode=zone_mode,
         zone_radius_km=float(zone_radius_km),
         zone_seed=zone_seed,
@@ -399,9 +386,6 @@ def _firestore_cards(
     return cards
 
 
-# -----------------------
-# Tool functions for OpenAI
-# -----------------------
 def tool_google_specific_search(query: str, location_hint: Optional[str] = None, limit: int = 5) -> dict:
     limit = _clamp_limit(limit)
     return {"places": _google_search_lebanon(query=query, location_hint=location_hint, limit=limit)}
@@ -481,17 +465,14 @@ def tool_firestore_recommend(
     }
 
 
-# -----------------------
-# OpenAI tools schema
-# -----------------------
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "google_specific_search",
             "description": (
-                "Use for specific place/entity lookup (brand/proper noun) OR when user asks for rating/address/details "
-                "of a named place. Google Places only, restricted to Lebanon."
+                "Use for specific place/entity lookup OR when user asks for rating/address/details of a named place. "
+                "Google Places only, restricted to Lebanon."
             ),
             "parameters": {
                 "type": "object",
@@ -508,10 +489,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "google_place_details",
-            "description": (
-                "Use when the user asks for more details about a specific named place. "
-                "Returns one best-match place restricted to Lebanon."
-            ),
+            "description": "Use when the user asks for more details about a specific named place. Returns one best-match place restricted to Lebanon.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -526,10 +504,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "compare_places",
-            "description": (
-                "Use when the user asks to compare two places. "
-                "Comparison is based on available public data and may not be 100% accurate."
-            ),
+            "description": "Use when the user asks to compare two places. Comparison is based on available public data and may not be 100% accurate.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -545,10 +520,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "firestore_recommend",
-            "description": (
-                "Use for preference-based recommendations based on user's profile (ambiance/features/personality). "
-                "Uses Firestore-first ranking and returns place cards."
-            ),
+            "description": "Use for preference-based recommendations based on user's profile. Uses Firestore-first ranking and returns place cards.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -591,7 +563,7 @@ Tool routing rules (must follow):
 
 Formatting rules (STRICT):
 - Reply must be plain text only.
-- Do NOT use markdown (no ###, **, -, numbered lists, or [text](url)).
+- Do NOT use markdown.
 - Keep replies short and conversational.
 - If places are returned, summarize briefly; place cards are shown via the UI, not as a list in text.
 """
@@ -631,7 +603,6 @@ def chat(req: ChatRequest):
 
     limit = _clamp_limit(req.limit)
 
-    # Fast path: greetings / small talk => no tools, no place spam
     if _is_small_talk(msg):
         return {"reply": _pick_reply([
             "Hey! What are you in the mood for — food, activities, or both?",
@@ -639,17 +610,27 @@ def chat(req: ChatRequest):
             "Hi! Tell me what you feel like doing — eating, going out, or both?",
         ]), "places": []}
 
-    # Determine location hint from message if user provided one
     msg_loc_hint = _extract_location_hint(msg)
     effective_loc = msg_loc_hint or req.location_hint or "Lebanon"
 
-    # Detect "more/other/different/random"
     wants_more = bool(_MORE_RE.search(msg))
 
-    # For "more/other" with no category word, use last_mode
+    if _COMPARE_RE.search(msg):
+        pair = _try_parse_compare(msg)
+        if pair:
+            a, b = pair
+            comp_res = tool_compare_places(a, b, location_hint=effective_loc)
+            comp = (comp_res.get("comparison") or {})
+            summary = (comp.get("summary") or "").strip()
+            places_out = [p for p in [comp.get("place_a"), comp.get("place_b")] if p]
+
+            reply = summary if summary else "Based on available data, here’s what I found for both places in Lebanon."
+            if len(reply) > 220:
+                reply = reply[:220].rstrip() + "..."
+            return {"reply": reply, "places": places_out}
+
     mode = _suggestion_mode(msg, fallback_last_mode=req.last_mode)
 
-    # If user asks for "more" but we don't know last_mode and didn't detect category, ask once
     if wants_more and mode == "unknown":
         return {"reply": _pick_reply([
             "Sure — do you want more restaurants, more activities, or both?",
@@ -657,20 +638,14 @@ def chat(req: ChatRequest):
             "What should I expand — restaurants, activities, or both?",
         ]), "places": []}
 
-    # Fast path: suggestion / category requests
     if mode in ("restaurant", "activity", "both"):
         places_out: list[dict] = []
-
-        # Use random zone-mode when user asked for more/other/different/random
         zone_mode = wants_more
-        # Each request should give different results
         seed_base = int(time.time() * 1000)
         exclude_ids = req.exclude_place_ids or []
 
-        # Nightlife: prefer Google; also allow "more" by excluding ids
         if mode in ("activity", "both") and _NIGHTLIFE_RE.search(msg):
             google_cards = _google_search_lebanon(query=msg, location_hint=effective_loc, limit=limit + 6)
-            # filter excluded
             filtered = []
             ex = set(exclude_ids)
             for c in google_cards:
@@ -690,7 +665,6 @@ def chat(req: ChatRequest):
                 "places": places_out
             }
 
-        # Restaurants
         if mode in ("restaurant", "both"):
             places_out.extend(_firestore_cards(
                 recommendation_type="restaurant",
@@ -706,7 +680,6 @@ def chat(req: ChatRequest):
                 exclude_place_ids=exclude_ids,
             ))
 
-        # Activities
         if mode in ("activity", "both"):
             places_out.extend(_firestore_cards(
                 recommendation_type="activity",
@@ -724,7 +697,6 @@ def chat(req: ChatRequest):
 
         places_out = _dedupe_places(places_out)
 
-        # If user asked for more but we still got nothing new, relax exclusion once
         if wants_more and not places_out and exclude_ids:
             if mode in ("restaurant", "both"):
                 places_out.extend(_firestore_cards(
@@ -758,7 +730,6 @@ def chat(req: ChatRequest):
 
         return {"reply": _reply_for_mode(mode, more=wants_more), "places": places_out}
 
-    # If it's asking for places but unclear type => ask one question, no tools
     if (_SUGGEST_RE.search(msg) or _ASK_PLACES_RE.search(msg)) and mode == "unknown":
         return {"reply": _pick_reply([
             "Sure — do you want restaurant suggestions, activity suggestions, or both?",
@@ -766,7 +737,6 @@ def chat(req: ChatRequest):
             "Tell me what you want: restaurants, activities, or both?",
         ]), "places": []}
 
-    # Otherwise: let OpenAI pick tools (but keep replies short)
     ctx = {
         "location_hint": effective_loc,
         "limit": limit,
@@ -796,7 +766,6 @@ def chat(req: ChatRequest):
         tool_calls = getattr(m, "tool_calls", None)
 
         if not tool_calls:
-            # Keep reply short and plain text
             text = strip_markdown((m.content or "").strip())
             if len(text) > 220:
                 text = text[:220].rstrip() + "..."
@@ -845,7 +814,7 @@ def chat(req: ChatRequest):
                     user_latitude=req.latitude,
                     user_longitude=req.longitude,
                     location_hint=effective_loc,
-                    zone_mode=wants_more,                       # apply random zone when user asks for more/different
+                    zone_mode=wants_more,
                     zone_radius_km=6.0 if rec_type == "restaurant" else 10.0,
                     zone_seed=int(time.time() * 1000),
                     exclude_place_ids=req.exclude_place_ids or [],
