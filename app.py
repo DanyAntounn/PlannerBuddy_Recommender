@@ -43,6 +43,8 @@ class FirestoreTripRequest(BaseModel):
     user_food: UserProfile
     user_act: UserProfile
 
+    personality_profile: Optional[dict] = None  # <-- ADD THIS
+
     num_restaurants: int = 1
     num_activities: int = 2
 
@@ -50,6 +52,7 @@ class FirestoreTripRequest(BaseModel):
 
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
 
 class MapFilterRequest(BaseModel):
     user_food: UserProfile
@@ -157,6 +160,7 @@ def firestore_trip(req: FirestoreTripRequest):
             query=req.query,
             user_food=req.user_food.dict(),
             user_act=req.user_act.dict(),
+            personality_profile=req.personality_profile,  # <-- ADD THIS
             user_latitude=user_lat,
             user_longitude=user_lon,
         )
@@ -169,6 +173,7 @@ def firestore_trip(req: FirestoreTripRequest):
     res = firestore_trip_generate(
         req.user_food.dict(),
         req.user_act.dict(),
+        personality_profile=req.personality_profile, 
         num_restaurants=num_restaurants,
         num_activities=num_activities,
         location="Lebanon",
