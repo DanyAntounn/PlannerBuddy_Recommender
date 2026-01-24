@@ -356,6 +356,41 @@ def match_user_to_place(profile, place_profile, typ):
 
     return score
 
+# ========== Personality → User profile adapter ==========
+def apply_personality_to_profiles(personality, user_food, user_act):
+    vibes = set((personality.get("vibe_preferences") or []))
+    noise = float(personality.get("noise_tolerance", 0.5))
+    cultural = float(personality.get("cultural_interest", 0.5))
+    budget = float(personality.get("budget_sensitivity", 0.5))
+
+    vibe_to_amb = {
+        "cozy": ["cozy", "warm", "relaxing", "quiet"],
+        "adventurous": ["outdoor", "nature", "hiking", "exploring", "scenic"],
+    }
+
+    amb = []
+    for v in vibes:
+        amb += vibe_to_amb.get(v, [])
+
+    if noise <= 0.35:
+        amb += ["quiet", "calm", "peaceful"]
+
+    if cultural >= 0.6:
+        user_act.setdefault("preferred_primary_features", [])
+        user_act["preferred_primary_features"] += [
+            "museum", "historical", "heritage", "ruins", "gallery"
+        ]
+
+    user_food["rating_threshold"] = 4.0 if budget >= 0.6 else 3.5
+    user_act["rating_threshold"] = 4.0 if budget >= 0.6 else 3.5
+    user_food["min_reviews_count"] = 30
+    user_act["min_reviews_count"] = 20
+
+    user_food["ambiance"] = sorted(set(user_food.get("ambiance", []) + amb))
+    user_act["ambiance"] = sorted(set(user_act.get("ambiance", []) + amb))
+
+    return user_food, user_act
+
 # ========== Distance helpers (small bias + diversity) ==========
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
@@ -731,28 +766,66 @@ def rank_places_from_firestore(
 def firestore_trip_generate(
     user_food: dict,
     user_act: dict,
+    personality_profile: dict | None = None,
     num_restaurants: int = 1,
     num_activities: int = 2,
     location: str = "Beirut, Lebanon",
     user_latitude: float | None = None,
     user_longitude: float | None = None,
 ):
+    """
+    Firestore-backed trip generator with:
+    - personality_profile applied to user_food/user_act (if provided)
+    - de-duplicating across the whole trip
+    - zone mode centered around the user's location (prevents random Lebanon picks)
+    - keeps your existing diversity/clumping-avoidance behavior
+    """
+
+    # Apply personality to user profiles (if you added apply_personality_to_profiles)
+    if personality_profile:
+        try:
+            user_food, user_act = apply_personality_to_profiles(
+                personality_profile,
+                user_food,
+                user_act,
+            )
+        except Exception:
+            pass
+
+    # Remove generic placeholders that cannot match your stored primary_features
+    # (Your place primary_features are like "italian", "pizza", "hiking", "museum", not "restaurant"/"activity")
+    def _strip_generic(user_profile: dict):
+        p1 = user_profile.get("preferred_primary_features", []) or []
+        p2 = user_profile.get("preferred_secondary_features", []) or []
+        user_profile["preferred_primary_features"] = [x for x in p1 if x not in ("restaurant", "activity")]
+        user_profile["preferred_secondary_features"] = [x for x in p2 if x not in ("restaurant", "activity")]
+        return user_profile
+
+    user_food = _strip_generic(user_food)
+    user_act = _strip_generic(user_act)
+
     plan: list[dict] = []
 
-    food_kw = " ".join(user_food.get("preferred_primary_features", [])[:2]) or "restaurant"
-    act_kw = " ".join(user_act.get("preferred_primary_features", [])[:3]) or "activity"
+    # Keywords used only for query boost inside rank_places_from_firestore
+    food_kw = " ".join((user_food.get("preferred_primary_features") or [])[:2]).strip() or "restaurant"
+    act_kw = " ".join((user_act.get("preferred_primary_features") or [])[:3]).strip() or "activity"
 
-    # milliseconds so back-to-back requests differ
+    # Ensure back-to-back requests differ
     seed_base = int(time.time() * 1000)
 
-    # prevent duplicates across whole trip
+    # Prevent duplicates across whole trip
     chosen_place_ids: set[str] = set()
     chosen_doc_ids: set[str] = set()
 
-    # prevent clumping: keep zone centers used so far
+    # Prevent clumping: keep zone centers used so far
     used_zone_centers: list[tuple[float, float]] = []
 
-    # -------- Restaurants: each item gets its own random zone --------
+    # Zone center: center around the user if available (this is important)
+    zone_center = None
+    if user_latitude is not None and user_longitude is not None:
+        zone_center = (float(user_latitude), float(user_longitude))
+
+    # -------- Restaurants: each item gets its own zone seed (diverse picks around the user) --------
     restaurants: list[dict] = []
     for i in range(int(num_restaurants)):
         recs = rank_places_from_firestore(
@@ -767,6 +840,7 @@ def firestore_trip_generate(
             location_hint=location,
 
             zone_mode=True,
+            zone_center=zone_center,
             zone_radius_km=6.0,
             zone_seed=seed_base + 1000 + i,
 
@@ -783,24 +857,22 @@ def firestore_trip_generate(
         pick = recs[0]
         restaurants.append(pick)
 
-        # track duplicates
         gpid = (pick.get("profile") or {}).get("google_place_id")
         if gpid:
             chosen_place_ids.add(gpid)
         if pick.get("doc_id"):
             chosen_doc_ids.add(pick["doc_id"])
 
-        # track used zone center (pin)
         zu = pick.get("zone_used")
         if zu and "lat" in zu and "lon" in zu:
             used_zone_centers.append((float(zu["lat"]), float(zu["lon"])))
 
     plan.append({
-        "requirement": {"type": "restaurant", "count": num_restaurants, "keywords": [food_kw], "location_hint": None},
+        "requirement": {"type": "restaurant", "count": int(num_restaurants), "keywords": [food_kw], "location_hint": None},
         "recommendations": restaurants,
     })
 
-    # -------- Activities: each item gets its own random zone --------
+    # -------- Activities: same logic, slightly larger radius --------
     activities: list[dict] = []
     for i in range(int(num_activities)):
         recs = rank_places_from_firestore(
@@ -815,6 +887,7 @@ def firestore_trip_generate(
             location_hint=location,
 
             zone_mode=True,
+            zone_center=zone_center,
             zone_radius_km=10.0,
             zone_seed=seed_base + 2000 + i,
 
@@ -831,24 +904,23 @@ def firestore_trip_generate(
         pick = recs[0]
         activities.append(pick)
 
-        # track duplicates
         gpid = (pick.get("profile") or {}).get("google_place_id")
         if gpid:
             chosen_place_ids.add(gpid)
         if pick.get("doc_id"):
             chosen_doc_ids.add(pick["doc_id"])
 
-        # track used zone center (pin)
         zu = pick.get("zone_used")
         if zu and "lat" in zu and "lon" in zu:
             used_zone_centers.append((float(zu["lat"]), float(zu["lon"])))
 
     plan.append({
-        "requirement": {"type": "activity", "count": num_activities, "keywords": [act_kw], "location_hint": None},
+        "requirement": {"type": "activity", "count": int(num_activities), "keywords": [act_kw], "location_hint": None},
         "recommendations": activities,
     })
 
     return {"plan": plan}
+
 
 
 
