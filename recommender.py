@@ -355,6 +355,42 @@ def match_user_to_place(profile, place_profile, typ):
         score += 2
 
     return score
+    
+def match_user_to_user(me: dict, other: dict) -> float:
+    """
+    Personality-based compatibility score for Meetup
+    """
+
+    score = 0.0
+
+    # ---- Vibes (strong signal)
+    my_vibes = set(me.get("vibe_preferences", []))
+    their_vibes = set(other.get("vibe_preferences", []))
+    score += len(my_vibes & their_vibes) * 4
+
+    # ---- Numeric traits (0..1 similarity)
+    def sim(a, b, weight):
+        if a is None or b is None:
+            return 0
+        return (1 - abs(float(a) - float(b))) * weight
+
+    score += sim(me.get("noise_tolerance"), other.get("noise_tolerance"), 3)
+    score += sim(me.get("social_energy"), other.get("social_energy"), 3)
+    score += sim(me.get("cultural_interest"), other.get("cultural_interest"), 2)
+
+    # ---- Group style
+    if me.get("group_style") and me.get("group_style") == other.get("group_style"):
+        score += 2
+
+    # ---- Budget mismatch penalty
+    if (
+        me.get("budget_sensitivity") is not None
+        and other.get("budget_sensitivity") is not None
+        and abs(me["budget_sensitivity"] - other["budget_sensitivity"]) > 0.5
+    ):
+        score -= 2
+
+    return round(score, 2)
 
 # ========== Personality → User profile adapter ==========
 def apply_personality_to_profiles(personality, user_food, user_act):
