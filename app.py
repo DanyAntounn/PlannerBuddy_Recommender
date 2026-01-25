@@ -76,6 +76,7 @@ class MapFilterRequest(BaseModel):
     restaurant_intent: Optional[str] = ""
     activity_intent: Optional[str] = ""
 
+
 class MeetupProfile(BaseModel):
     vibe_preferences: List[str] = []
     noise_tolerance: float = 0.5
@@ -84,6 +85,7 @@ class MeetupProfile(BaseModel):
     social_energy: float = 0.5
     group_style: Optional[str] = None  # "solo" | "group" | etc.
 
+
 class MeetupMatchesRequest(BaseModel):
     user_id: str
     profile: MeetupProfile
@@ -91,6 +93,7 @@ class MeetupMatchesRequest(BaseModel):
     longitude: float
     radius_km: float = 5.0
     limit: int = 10
+
 
 def _get_photo_reference(place_id: str) -> str | None:
     if not GOOGLE_API_KEY:
@@ -192,7 +195,7 @@ def firestore_trip(req: FirestoreTripRequest):
     res = firestore_trip_generate(
         req.user_food.dict(),
         req.user_act.dict(),
-        personality_profile=req.personality_profile, 
+        personality_profile=req.personality_profile,
         num_restaurants=num_restaurants,
         num_activities=num_activities,
         location="Lebanon",
@@ -201,6 +204,7 @@ def firestore_trip(req: FirestoreTripRequest):
     )
     flutter_payload = build_flutter_payload(res["plan"])
     return {"plan": flutter_payload}
+
 
 @app.post("/map-filter")
 def map_filter(req: MapFilterRequest):
@@ -234,6 +238,34 @@ def map_filter(req: MapFilterRequest):
         force_location=False,
         location_hint=location_hint,
     )
+
+    def to_card(item: dict, typ: str) -> dict:
+        p = item.get("profile") or {}
+        gpid = p.get("google_place_id")
+
+        card = {
+            "type": typ,  # "restaurant" or "activity"
+            "name": item.get("name"),
+            "score": float(item.get("score") or 0.0),
+            "rating": float(p.get("rating") or 0.0),
+            "num_reviews": int(p.get("num_reviews") or 0),
+            "address": p.get("address"),
+            "place_id": gpid,
+            "latitude": p.get("latitude"),
+            "longitude": p.get("longitude"),
+        }
+
+        if gpid and os.getenv("PUBLIC_BASE_URL", "").strip():
+            base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+            card["image_url"] = f"{base}/photo?place_id={gpid}"
+
+        return card
+
+    return {
+        "restaurants": [to_card(x, "restaurant") for x in restaurants],
+        "activities": [to_card(x, "activity") for x in activities],
+    }
+
 
 @app.post("/meetup-matches")
 def meetup_matches(req: MeetupMatchesRequest):
@@ -312,60 +344,3 @@ def meetup_matches(req: MeetupMatchesRequest):
         "count": len(candidates[:limit]),
         "matches": candidates[:limit],
     }
-    
-    def match_user_to_user(me: dict, other: dict) -> float:
-    score = 0.0
-
-    my_vibes = set(me.get("vibe_preferences", []) or [])
-    their_vibes = set(other.get("vibe_preferences", []) or [])
-    score += len(my_vibes & their_vibes) * 4
-
-    def sim(a, b, weight):
-        if a is None or b is None:
-            return 0.0
-        return (1.0 - abs(float(a) - float(b))) * float(weight)
-
-    score += sim(me.get("noise_tolerance"), other.get("noise_tolerance"), 3)
-    score += sim(me.get("social_energy"), other.get("social_energy"), 3)
-    score += sim(me.get("cultural_interest"), other.get("cultural_interest"), 2)
-
-    if me.get("group_style") and me.get("group_style") == other.get("group_style"):
-        score += 2
-
-    if (
-        me.get("budget_sensitivity") is not None
-        and other.get("budget_sensitivity") is not None
-        and abs(float(me["budget_sensitivity"]) - float(other["budget_sensitivity"])) > 0.5
-    ):
-        score -= 2
-
-    return round(float(score), 2)
-
-    def to_card(item: dict, typ: str) -> dict:
-        p = item.get("profile") or {}
-        gpid = p.get("google_place_id")
-
-        card = {
-            "type": typ,  # "restaurant" or "activity"
-            "name": item.get("name"),
-            "score": float(item.get("score") or 0.0),
-            "rating": float(p.get("rating") or 0.0),
-            "num_reviews": int(p.get("num_reviews") or 0),
-            "address": p.get("address"),
-            "place_id": gpid,
-            "latitude": p.get("latitude"),
-            "longitude": p.get("longitude"),
-        }
-
-        if gpid and os.getenv("PUBLIC_BASE_URL", "").strip():
-            base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-            card["image_url"] = f"{base}/photo?place_id={gpid}"
-
-        return card
-
-    return {
-        "restaurants": [to_card(x, "restaurant") for x in restaurants],
-        "activities": [to_card(x, "activity") for x in activities],
-    }
-
-
