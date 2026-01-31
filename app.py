@@ -280,27 +280,27 @@ def meetup_matches(req: MeetupMatchesRequest):
         raise HTTPException(status_code=400, detail="user_id is required")
 
     candidates = []
-    docs = db.collection("PersonalityProfile").stream()
 
-    for snap in docs:
+    # 1) read personality from personality_profiles
+    profile_snaps = db.collection("personality_profiles").stream()
+
+    for snap in profile_snaps:
         data = snap.to_dict() or {}
 
-        other_id = (data.get("userId") or data.get("user_id") or snap.id)
-        if str(other_id) == me_id:
+        # Determine candidate userId
+        other_id = str(data.get("user_id") or data.get("userId") or snap.id).strip()
+        if not other_id or other_id == me_id:
             continue
 
-        # location extraction: supports latitude/longitude fields OR a GeoPoint in "location"
-        lat = data.get("latitude")
-        lon = data.get("longitude")
+        # 2) read location + name from users/{id}
+        user_doc = db.collection("users").document(other_id).get()
+        if not user_doc.exists:
+            continue
 
-        loc = data.get("location")
-        if (lat is None or lon is None) and loc is not None:
-            if hasattr(loc, "latitude") and hasattr(loc, "longitude"):
-                lat = loc.latitude
-                lon = loc.longitude
-            elif isinstance(loc, dict):
-                lat = loc.get("latitude")
-                lon = loc.get("longitude")
+        user_data = user_doc.to_dict() or {}
+        loc = user_data.get("location") or {}
+        lat = loc.get("lat")
+        lon = loc.get("lon")
 
         if lat is None or lon is None:
             continue
@@ -327,12 +327,12 @@ def meetup_matches(req: MeetupMatchesRequest):
         s = match_user_to_user(me_profile, other_profile)
 
         candidates.append({
-            "user_id": str(other_id),
+            "user_id": other_id,
             "score": float(s),
             "distance_km": round(float(d), 2),
             "latitude": lat,
             "longitude": lon,
-            "display_name": data.get("display_name") or data.get("name"),
+            "display_name": user_data.get("name") or user_data.get("display_name"),
             "vibe_preferences": other_profile["vibe_preferences"],
             "group_style": other_profile["group_style"],
         })
