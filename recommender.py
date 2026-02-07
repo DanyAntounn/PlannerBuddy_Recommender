@@ -484,6 +484,74 @@ def diversify_by_distance(candidates: list[dict], k: int, min_spread_km: float =
 
     return chosen
 
+# Landmarks should bypass zone filtering (e.g., beaches)
+LANDMARK_KEYWORDS = {"beach", "landmark"}
+
+def is_landmark_place(profile: dict) -> bool:
+    if not profile:
+        return False
+    name = (profile.get("name") or "").lower()
+    primary = [str(x).lower() for x in (profile.get("primary_features") or [])]
+    secondary = [str(x).lower() for x in (profile.get("secondary_features") or [])]
+    types = [str(x).lower() for x in (profile.get("types") or [])]
+    for kw in LANDMARK_KEYWORDS:
+        if kw in name or kw in primary or kw in secondary or kw in types:
+            return True
+    return False
+
+def pick_random_zone_center_around_anchor(
+    anchor_lat: float,
+    anchor_lon: float,
+    max_offset_km: float,
+    seed: int | None,
+    used_centers: list[tuple[float, float]] | None = None,
+    avoid_within_km: float = 18.0,
+    attempts: int = 10,
+) -> tuple[float, float] | None:
+    """
+    Picks a random zone center around an anchor point within max_offset_km.
+    Tries to avoid centers too close to used_centers.
+    """
+    if anchor_lat is None or anchor_lon is None or max_offset_km <= 0:
+        return None
+
+    rng = random.Random(seed)
+    used_centers = used_centers or []
+
+    R = 6371.0
+    lat1 = math.radians(anchor_lat)
+    lon1 = math.radians(anchor_lon)
+
+    candidate = None
+    for _ in range(max(1, attempts)):
+        # sqrt for uniform distribution over the circle area
+        d = max_offset_km * math.sqrt(rng.random())
+        bearing = rng.random() * 2 * math.pi
+
+        ang = d / R
+        lat2 = math.asin(
+            math.sin(lat1) * math.cos(ang)
+            + math.cos(lat1) * math.sin(ang) * math.cos(bearing)
+        )
+        lon2 = lon1 + math.atan2(
+            math.sin(bearing) * math.sin(ang) * math.cos(lat1),
+            math.cos(ang) - math.sin(lat1) * math.sin(lat2),
+        )
+
+        clat = math.degrees(lat2)
+        clon = math.degrees(lon2)
+        candidate = (clat, clon)
+
+        too_close = False
+        for ulat, ulon in used_centers:
+            if haversine_km(clat, clon, ulat, ulon) < avoid_within_km:
+                too_close = True
+                break
+        if not too_close:
+            return candidate
+
+    return candidate
+
 # ========== Firestore helpers ==========
 def build_profile_from_firestore_doc(doc_data: dict, recommendation_type: str):
     rating = float(doc_data.get("rating", 0.0) or 0.0)
@@ -663,6 +731,8 @@ def rank_places_from_firestore(
     zone_center: tuple[float, float] | None = None,
     zone_seed: int | None = None,
     zone_pool_size: int = 250,
+    zone_anchor_max_km: float = 8.0,
+    zone_attempts: int = 4,
 
     exclude_place_ids: list[str] | None = None,
     exclude_doc_ids: list[str] | None = None,
@@ -731,50 +801,66 @@ def rank_places_from_firestore(
     # ZONE MODE (random pin + radius filter)
     # -------------------------
     if zone_mode and scored:
-        # Choose center
-        if zone_center is not None:
-            zone_used = zone_center
-        else:
-            pool = scored[:max(zone_pool_size, top_n * 10)]
-            zone_used = pick_random_zone_center_diverse_excluding(
-                pool,
-                seed=zone_seed,
-                used_centers=used_zone_centers,
-                centers_k=25,
-                min_spread_km=8.0,
-                avoid_within_km=float(avoid_zone_centers_within_km),
-            )
+        best_zone_scored: list[dict] = []
+        best_zone_used: tuple[float, float] | None = None
+        attempts = max(1, int(zone_attempts))
 
-        if zone_used is not None:
+        for attempt in range(attempts):
+            # Choose center
+            if zone_center is not None:
+                zone_used = zone_center
+            else:
+                seed_try = None if zone_seed is None else int(zone_seed) + attempt
+
+                if user_latitude is not None and user_longitude is not None:
+                    zone_used = pick_random_zone_center_around_anchor(
+                        float(user_latitude),
+                        float(user_longitude),
+                        float(zone_anchor_max_km),
+                        seed=seed_try,
+                        used_centers=used_zone_centers,
+                        avoid_within_km=float(avoid_zone_centers_within_km),
+                    )
+                else:
+                    pool = scored[:max(zone_pool_size, top_n * 10)]
+                    zone_used = pick_random_zone_center_diverse_excluding(
+                        pool,
+                        seed=seed_try,
+                        used_centers=used_zone_centers,
+                        centers_k=25,
+                        min_spread_km=8.0,
+                        avoid_within_km=float(avoid_zone_centers_within_km),
+                    )
+
+            if zone_used is None:
+                continue
+
             zlat, zlon = zone_used
-
             zone_scored: list[dict] = []
+
             for item in scored:
                 p = item.get("profile") or {}
+                if is_landmark_place(p):
+                    zone_scored.append(item)
+                    continue
+
                 plat, plon = _get_lat_lon_from_profile(p)
                 if plat is None or plon is None:
                     continue
                 if within_radius_km(zlat, zlon, plat, plon, zone_radius_km):
                     zone_scored.append(item)
 
-            # widen once if too small
-            if len(zone_scored) < max(3, top_n):
-                widened = float(zone_radius_km) * 1.8
-                zone_scored2: list[dict] = []
-                for item in scored:
-                    p = item.get("profile") or {}
-                    plat, plon = _get_lat_lon_from_profile(p)
-                    if plat is None or plon is None:
-                        continue
-                    if within_radius_km(zlat, zlon, plat, plon, widened):
-                        zone_scored2.append(item)
+            if len(zone_scored) > len(best_zone_scored):
+                best_zone_scored = zone_scored
+                best_zone_used = zone_used
 
-                if len(zone_scored2) >= len(zone_scored):
-                    zone_scored = zone_scored2
-
-            # only replace scored if the zone has enough items
             if len(zone_scored) >= max(3, top_n):
                 scored = zone_scored
+                break
+        else:
+            if best_zone_scored:
+                scored = best_zone_scored
+                zone_used = best_zone_used
 
     # -------------------------
     # Final selection
@@ -813,7 +899,7 @@ def firestore_trip_generate(
     Firestore-backed trip generator with:
     - personality_profile applied to user_food/user_act (if provided)
     - de-duplicating across the whole trip
-    - zone mode centered around the user's location (prevents random Lebanon picks)
+    - randomized zone mode around the user's location (prevents random Lebanon picks)
     - keeps your existing diversity/clumping-avoidance behavior
     """
 
@@ -856,11 +942,6 @@ def firestore_trip_generate(
     # Prevent clumping: keep zone centers used so far
     used_zone_centers: list[tuple[float, float]] = []
 
-    # Zone center: center around the user if available (this is important)
-    zone_center = None
-    if user_latitude is not None and user_longitude is not None:
-        zone_center = (float(user_latitude), float(user_longitude))
-
     # -------- Restaurants: each item gets its own zone seed (diverse picks around the user) --------
     restaurants: list[dict] = []
     for i in range(int(num_restaurants)):
@@ -876,8 +957,10 @@ def firestore_trip_generate(
             location_hint=location,
 
             zone_mode=True,
-            zone_center=zone_center,
-            zone_radius_km=6.0,
+            zone_center=None,
+            zone_radius_km=8.0,
+            zone_anchor_max_km=8.0,
+            zone_attempts=4,
             zone_seed=seed_base + 1000 + i,
 
             exclude_place_ids=list(chosen_place_ids),
@@ -908,7 +991,7 @@ def firestore_trip_generate(
         "recommendations": restaurants,
     })
 
-    # -------- Activities: same logic, slightly larger radius --------
+    # -------- Activities: same logic --------
     activities: list[dict] = []
     for i in range(int(num_activities)):
         recs = rank_places_from_firestore(
@@ -923,8 +1006,10 @@ def firestore_trip_generate(
             location_hint=location,
 
             zone_mode=True,
-            zone_center=zone_center,
-            zone_radius_km=10.0,
+            zone_center=None,
+            zone_radius_km=8.0,
+            zone_anchor_max_km=8.0,
+            zone_attempts=4,
             zone_seed=seed_base + 2000 + i,
 
             exclude_place_ids=list(chosen_place_ids),
