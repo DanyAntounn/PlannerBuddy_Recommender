@@ -733,6 +733,7 @@ def rank_places_from_firestore(
     zone_pool_size: int = 250,
     zone_anchor_max_km: float = 8.0,
     zone_attempts: int = 4,
+    randomize_with_seed: bool = True,
 
     exclude_place_ids: list[str] | None = None,
     exclude_doc_ids: list[str] | None = None,
@@ -746,7 +747,7 @@ def rank_places_from_firestore(
 
     docs = db.collection(collection_name).stream()
     q_tokens = preprocess_text(query)
-    scored: list[dict] = []
+    candidates: list[dict] = []
 
     loc_lower = (location_hint or "").strip().lower()
 
@@ -771,37 +772,56 @@ def rank_places_from_firestore(
             if loc_lower not in addr and loc_lower not in name:
                 continue
 
-        s = match_user_to_place(user_profile, place_profile, recommendation_type)
-
-        # keyword boost
-        if q_tokens:
-            combined_features = (place_profile.get("primary_features") or []) + (place_profile.get("secondary_features") or [])
-            if any(qt in combined_features for qt in q_tokens):
-                s += 4
-
-        # small distance bias (as you had)
-        if not force_location:
-            s += distance_bias_bonus(
-                user_latitude, user_longitude,
-                place_profile.get("latitude"), place_profile.get("longitude"),
-            )
-
-        scored.append({
+        candidates.append({
             "name": place_profile.get("name"),
-            "score": float(s),
             "profile": place_profile,
             "doc_id": snap.id,
         })
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
+    def _score_items(items: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for item in items:
+            place_profile = item.get("profile") or {}
+            s = match_user_to_place(user_profile, place_profile, recommendation_type)
+
+            # keyword boost
+            if q_tokens:
+                combined_features = (place_profile.get("primary_features") or []) + (place_profile.get("secondary_features") or [])
+                if any(qt in combined_features for qt in q_tokens):
+                    s += 4
+
+            # small distance bias (as you had)
+            if not force_location:
+                s += distance_bias_bonus(
+                    user_latitude, user_longitude,
+                    place_profile.get("latitude"), place_profile.get("longitude"),
+                )
+
+            out.append({
+                "name": item.get("name"),
+                "score": float(s),
+                "profile": place_profile,
+                "doc_id": item.get("doc_id"),
+            })
+
+        out.sort(key=lambda x: x["score"], reverse=True)
+
+        # Optional: add deterministic randomness per request to break ties and vary picks
+        if randomize_with_seed and zone_seed is not None:
+            rng = random.Random(int(zone_seed))
+            for item in out:
+                item["_rand"] = rng.random()
+            out.sort(key=lambda x: (x["score"], x["_rand"]), reverse=True)
+
+        return out
 
     zone_used: tuple[float, float] | None = None
 
     # -------------------------
     # ZONE MODE (random pin + radius filter)
     # -------------------------
-    if zone_mode and scored:
-        best_zone_scored: list[dict] = []
+    if zone_mode and candidates:
+        best_zone_candidates: list[dict] = []
         best_zone_used: tuple[float, float] | None = None
         attempts = max(1, int(zone_attempts))
 
@@ -822,7 +842,9 @@ def rank_places_from_firestore(
                         avoid_within_km=float(avoid_zone_centers_within_km),
                     )
                 else:
-                    pool = scored[:max(zone_pool_size, top_n * 10)]
+                    # build a temporary scored pool for center selection
+                    pool_scored = _score_items(candidates)
+                    pool = pool_scored[:max(zone_pool_size, top_n * 10)]
                     zone_used = pick_random_zone_center_diverse_excluding(
                         pool,
                         seed=seed_try,
@@ -836,31 +858,35 @@ def rank_places_from_firestore(
                 continue
 
             zlat, zlon = zone_used
-            zone_scored: list[dict] = []
+            zone_candidates: list[dict] = []
 
-            for item in scored:
+            for item in candidates:
                 p = item.get("profile") or {}
                 if is_landmark_place(p):
-                    zone_scored.append(item)
+                    zone_candidates.append(item)
                     continue
 
                 plat, plon = _get_lat_lon_from_profile(p)
                 if plat is None or plon is None:
                     continue
                 if within_radius_km(zlat, zlon, plat, plon, zone_radius_km):
-                    zone_scored.append(item)
+                    zone_candidates.append(item)
 
-            if len(zone_scored) > len(best_zone_scored):
-                best_zone_scored = zone_scored
+            if len(zone_candidates) > len(best_zone_candidates):
+                best_zone_candidates = zone_candidates
                 best_zone_used = zone_used
 
-            if len(zone_scored) >= max(3, top_n):
-                scored = zone_scored
+            if len(zone_candidates) >= max(3, top_n):
+                candidates = zone_candidates
                 break
         else:
-            if best_zone_scored:
-                scored = best_zone_scored
+            if best_zone_candidates:
+                candidates = best_zone_candidates
                 zone_used = best_zone_used
+    # -------------------------
+    # Score candidates (after zone filtering)
+    # -------------------------
+    scored = _score_items(candidates)
 
     # -------------------------
     # Final selection
